@@ -10,13 +10,6 @@ doing so (consecutive addresses at the beginning of lines; mapping
 between hex representation and ASCII representation of a byte is
 consistent.)
 
-## Installation
-```bash
-$ sudo apt install python3-pip
-$ pip3 install --upgrade pip
-$ pip3 install -r requirements.txt
-```
-
 ## Example usage
 
 - In U-Boot, do e.g. the following (and capture the serial communication):
@@ -64,5 +57,5 @@ $ python3 uboot_mdb_to_image.py outfile.log
 [+] Repairing image...
 100%|█████████████████████████████████████████████| 425997/425997 [00:00<00:00, 436458.66it/s]
 [+] Extracting...
-<...Clipping output...>
+
 ```
