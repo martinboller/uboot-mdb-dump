@@ -1,6 +1,0 @@
-#!/bin/sh
-chmod +x /usr/sbin/anywifi/BatchAuth
-chmod +x /etc/init.d/batchauth
-ln -s /etc/init.d/batchauth /etc/rc.d/S99batchauth
-rm -rf /etc/uci-defaults/batchauth
-

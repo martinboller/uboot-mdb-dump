@@ -1,7 +1,0 @@
-config info device
-	option server_url 'https://os.ac-link.com/api/get_firmware_url'
-	option device_model 'ZBT-WE1626'
-	option device_model_displayname 'WE1626'
-	option device_version '22.07.06'
-	option version_date '220706'
-	option comment '备注信息'

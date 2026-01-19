@@ -1,7 +1,0 @@
-config 'autoreboot' 'main'
-	#hour 1=>24 minute 0=>60
-
-	option enabled '0'
-	option hour '02'
-	option minute '36'
-	option weekdays 'Sun Mon Tue Wed Thu Fri Sat'

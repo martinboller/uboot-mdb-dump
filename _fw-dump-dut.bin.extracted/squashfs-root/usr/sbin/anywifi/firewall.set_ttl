@@ -1,3 +1,0 @@
-section="$(uci -X show firewall | awk -F '.' '/firewall.set_ttl/ {print $2}')"
-ttl_cnt="$(uci -q get firewall.${section}.ttl_cnt)"
-iptables -t mangle -A POSTROUTING -j TTL --ttl-set ${ttl_cnt:-64}

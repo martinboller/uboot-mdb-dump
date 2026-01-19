@@ -1,5 +1,0 @@
-config defaults main
-	option enable_yunlogin 1
-	option enable_softdog no
-	option watchdog_server1 8.8.8.8
-	option watchdog_server2 www.microsoft.com

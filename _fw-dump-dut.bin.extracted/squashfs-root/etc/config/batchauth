@@ -1,4 +1,0 @@
-config info apilist
-	option AuthServer 'http://vpn.anywifi.com:8000/api/dynamic_auth_code'
-config info device
-	option company_code '06e8f53c36fdfd4210d03fbd0f42eb86'

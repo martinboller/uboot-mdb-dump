@@ -1,3 +1,0 @@
-"3322.org"	"http://[USERNAME]:[PASSWORD]@members.3322.org/dyndns/update?system=dyndns&hostname=[DOMAIN]&myip=[IP]"		"good|nochg"
-"oray.com"	"http://[USERNAME]:[PASSWORD]@ddns.oray.com/ph/update?hostname=[DOMAIN]&myip=[IP]" 				"good|nochg"
-"dynu.com"      "http://api.dynu.com/nic/update?hostname=[DOMAIN]&myip=[IP]&username=[USERNAME]&password=[PASSWORD]"            "good|nochg"
