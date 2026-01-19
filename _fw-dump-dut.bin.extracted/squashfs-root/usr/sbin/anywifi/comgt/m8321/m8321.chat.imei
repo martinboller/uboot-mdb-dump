@@ -1,0 +1,8 @@
+opengt
+set com 115200n81
+set senddelay 0.05
+waitquiet 1 0.2
+
+send "at+cgsn^m"
+get 3 "OK" $s
+print $s

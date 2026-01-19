@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+
+START=98
+start(){
+	if [ ! -d /etc/crontabs ];then
+		logger "#Any_crond: Dir /etc/crontabs not exist, create it"
+		mkdir /etc/crontabs
+	fi
+
+	if [ ! -f /etc/crontabs/root ];then
+		logger "#Any_crond: crontab config file not exist, create it"
+		touch /etc/crontabs/root
+		chmod 777 /etc/crontabs/root
+	fi
+
+	res="$(cat /etc/crontabs/root | grep -F "*/1 * * * * /usr/sbin/anywifi/any_crond &")"
+	if [ -z "$res" ];then
+		echo "*/1 * * * * /usr/sbin/anywifi/any_crond &">> /etc/crontabs/root
+		/etc/init.d/cron restart
+	fi
+}

@@ -1,0 +1,723 @@
+#!/usr/bin/haserl --upload-limit=4096000 --upload-dir=/tmp --accept-all
+Content-type: text/html
+Access-Control-Allow-Origin:*
+Content-type: application/json
+
+<%
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+. /www/cgi-bin/webapi.common
+
+#Prepare the tmp file
+[ ! -d /tmp/anyos ] && mkdir /tmp/anyos
+#echo "$(set)"
+
+####
+op=$FORM_op
+
+if [ "$op" == "login" ];then
+	username="$FORM_username"
+	password="$FORM_password"
+
+	(passchk "$username" "$password")
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-4"
+		json_add_string reason "check passwork fail: username or password invalid"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	token="$(generate_token)"
+	wifi_type="$(my_uci_get anyos.wifi.wifi_type)"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "success"
+	json_add_string access_token "$token"
+	json_add_string wifi_type "$wifi_type"
+	echo -n "$(json_dump)"
+fi
+
+#登出直接删除当前的token文件
+if [ "$op" == "logout" ];then
+	if [ -n "$FORM_access_token" ];then
+		rm /tmp/webapi_token/session/${FORM_access_token}
+	fi
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "success"
+
+	echo -n "$(json_dump)"
+fi
+
+#直接使用系统密码
+if [ "$op" == "change_password_nocommit" ];then
+	body="$FORM_body"
+	json_load "$body"
+	json_get_var oldpassword oldpassword
+	json_get_var newpassword newpassword
+
+	(passchk "root" "$oldpassword")
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-4"
+		json_add_string reason "check passwork fail: username or password invalid"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	(echo "$newpassword";sleep 1;echo "$newpassword") | passwd > /dev/null
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "success"
+
+	echo -n "$(json_dump)"
+fi
+
+if [ "$op" == "change_password" ];then
+	body="$FORM_body"
+	json_load "$body"
+	json_get_var oldpassword oldpassword
+	json_get_var newpassword newpassword
+
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	(passchk "root" "$oldpassword")
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-4"
+		json_add_string reason "check passwork fail: username or password invalid"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	(echo "$newpassword";sleep 1;echo "$newpassword") | passwd > /dev/null
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "success"
+
+	echo -n "$(json_dump)"
+fi
+
+#至少换成静态文件
+if [ "$op" == "long_link" ];then
+	long_link
+fi
+
+#HOME
+if [ "$op" == "home_json" ];then
+	home_json
+fi
+
+if [ "$op" == "get_system_status" ];then
+	get_system_status
+fi
+
+if [ "$op" == "get_network_topology" ];then
+	get_network_topology
+fi
+
+if [ "$op" == "get_wan_traffic" ];then
+	get_wan_traffic
+fi
+
+if [ "$op" == "get_web_msg" ];then
+	get_web_msg
+fi
+
+#WAN
+if [ "$op" == "get_wan_status" ];then
+	get_wan_status
+fi
+
+if [ "$op" == "get_wan_config" ];then
+	get_wan_config
+fi
+
+if [ "$op" == "set_wan_config" ];then
+	set_wan_config
+fi
+
+if [ "$op" == "set_wan_config_nocommit" ];then
+	set_wan_config_nocommit
+fi
+
+if [ "$op" == "pppoe_detection" ];then
+	pppoe_detection
+fi
+
+if [ "$op" == "pppoe_disconnect" ];then
+	pppoe_disconnect
+fi
+
+if [ "$op" == "pppoe_reconnect" ];then
+	pppoe_reconnect
+fi
+
+#LAN
+if [ "$op" == "get_lan_status" ];then
+	get_lan_status
+fi
+
+if [ "$op" == "get_lan_config" ];then
+	get_lan_config
+fi
+
+if [ "$op" == "set_lan_config" ];then
+	set_lan_config
+fi
+
+#dhcp
+if [ "$op" == "get_dhcp_config" ];then
+	get_dhcp_config
+fi
+
+if [ "$op" == "set_dhcp_config" ];then
+	set_dhcp_config
+fi
+
+if [ "$op" == "get_dhcp_allocation" ];then
+	get_dhcp_allocation
+fi
+
+#终端管理
+if [ "$op" == "get_wifi_client" ];then
+	get_wifi_client
+fi
+
+if [ "$op" == "set_wifi_client" ];then
+	set_wifi_client
+fi
+
+if [ "$op" == "get_arp" ];then
+	get_arp
+fi
+
+#Nat acceleration
+if [ "$op" == "get_nat_acceleration" ];then
+	get_nat_acceleration
+fi
+
+if [ "$op" == "set_nat_acceleration" ];then
+	set_nat_acceleration
+fi
+
+#QOS
+if [ "$op" == "get_qos" ];then
+	get_qos
+fi
+
+if [ "$op" == "set_qos" ];then
+	set_qos
+fi
+
+if [ "$op" == "get_qos_status" ];then
+	get_qos_status
+fi
+
+if [ "$op" == "set_qos_status" ];then
+	set_qos_status
+fi
+
+#3G/4G
+if [ "$op" == "get_4g" ];then
+	get_4g
+fi
+
+if [ "$op" == "set_4g" ];then
+	set_4g
+fi
+
+if [ "$op" == "set_4g_sim" ];then
+	set_4g_sim
+fi
+
+if [ "$op" == "get_module_signal" ];then
+	get_module_signal
+fi
+
+if [ "$op" == "get_module_status" ];then
+	get_module_status
+fi
+
+if [ "$op" == "get_4g_log" ];then
+	get_4g_log
+fi
+
+#WIFI
+if [ "$op" == "search_ctcode_and_channals" ];then
+	search_ctcode_and_channals
+fi
+
+if [ "$op" == "getWiFi2" ];then
+	getWiFi2
+fi
+
+if [ "$op" == "setWiFi2" ];then
+	setWiFi2
+fi
+
+if [ "$op" == "setWiFi2_nocommit" ];then
+	setWiFi2_nocommit
+fi
+
+if [ "$op" == "get_wifi_guest" ];then
+	get_wifi_guest
+fi
+
+if [ "$op" == "set_wifi_guest" ];then
+	set_wifi_guest
+fi
+
+if [ "$op" == "getWiFi5" ];then
+	getWiFi5
+fi
+
+if [ "$op" == "setWiFi5" ];then
+	setWiFi5
+fi
+
+if [ "$op" == "setWiFi5_nocommit" ];then
+	setWiFi5_nocommit
+fi
+
+if [ "$op" == "get_wifi_guest5" ];then
+	get_wifi_guest5
+fi
+
+if [ "$op" == "set_wifi_guest5" ];then
+	set_wifi_guest5
+fi
+
+if [ "$op" == "get_wifi_power" ];then
+	get_wifi_power
+fi
+
+if [ "$op" == "set_wifi_power" ];then
+	set_wifi_power "$FORM_wifi_power"
+fi
+
+if [ "$op" == "get_wifi_apclient_config" ];then
+	get_wifi_apclient_config
+fi
+
+if [ "$op" == "get_wifi_apclient_status" ];then
+	get_wifi_apclient_status
+fi
+
+if [ "$op" == "set_wifi_apclient" ];then
+	set_wifi_apclient
+fi
+
+#高级配置
+if [ "$op" == "get_fw_setting" ];then
+	get_fw_setting
+fi
+
+if [ "$op" == "set_fw_setting" ];then
+	set_fw_setting
+fi
+
+if [ "$op" == "get_dmz" ];then
+	get_dmz
+fi
+
+if [ "$op" == "set_dmz" ];then
+	set_dmz
+fi
+
+if [ "$op" == "get_netwatchdog" ];then
+	get_netwatchdog
+fi
+
+if [ "$op" == "set_netwatchdog" ];then
+	set_netwatchdog
+fi
+
+if [ "$op" == "get_parents_ctrl_status" ];then
+	get_parents_ctrl_status
+fi
+
+if [ "$op" == "set_parents_ctrl_status" ];then
+	set_parents_ctrl_status
+fi
+
+if [ "$op" == "get_parents_ctrl_rule" ];then
+	get_parents_ctrl_rule
+fi
+
+if [ "$op" == "set_parents_ctrl_rule" ];then
+	set_parents_ctrl_rule
+fi
+
+if [ "$op" == "get_acl_rule" ];then
+	get_acl_rule
+fi
+
+if [ "$op" == "set_acl_rule" ];then
+	set_acl_rule
+fi
+
+if [ "$op" == "get_acl_status" ];then
+	get_acl_status
+fi
+
+if [ "$op" == "set_acl_status" ];then
+	set_acl_status
+fi
+
+if [ "$op" == "get_mac_blacklist" ];then
+	get_mac_blacklist
+fi
+
+if [ "$op" == "set_mac_blacklist" ];then
+	set_mac_blacklist
+fi
+
+if [ "$op" == "get_static_route" ];then
+	get_static_route
+fi
+
+if [ "$op" == "set_static_route" ];then
+	set_static_route
+fi
+
+if [ "$op" == "get_ddns" ];then
+	get_ddns
+fi
+
+if [ "$op" == "set_ddns" ];then
+	set_ddns
+fi
+
+if [ "$op" == "ddns_detection" ];then
+	ddns_detection
+fi
+
+if [ "$op" == "get_ddns_log" ];then
+	get_ddns_log
+fi
+
+if [ "$op" == "get_ddns_stat" ];then
+	get_ddns_stat
+fi
+
+if [ "$op" == "get_static_dhcp" ];then
+	get_static_dhcp
+fi
+
+if [ "$op" == "set_static_dhcp" ];then
+	set_static_dhcp
+fi
+
+if [ "$op" == "delete_static_dhcp" ];then
+	delete_static_dhcp
+fi
+
+if [ "$op" == "get_disk" ];then
+	get_disk
+fi
+
+if [ "$op" == "set_disk" ];then
+	set_disk
+fi
+
+#服务与应用
+if [ "$op" == "get_cloud_login" ];then
+	get_cloud_login
+fi
+
+if [ "$op" == "set_cloud_login" ];then
+	set_cloud_login
+fi
+
+if [ "$op" == "get_ac_info" ];then
+	get_ac_info
+fi
+
+if [ "$op" == "set_ac_info" ];then
+	set_ac_info
+fi
+
+if [ "$op" == "get_ac_switch" ];then
+	get_ac_switch
+fi
+
+if [ "$op" == "set_ac_switch" ];then
+	set_ac_switch
+fi
+
+if [ "$op" == "activate_ngrokc" ];then
+	activate_ngrokc
+fi
+
+if [ "$op" == "get_voice" ];then
+	get_voice
+fi
+
+if [ "$op" == "set_voice" ];then
+	set_voice
+fi
+###系统设置
+#系统升级
+if [ "$op" == "sysupgrade_upload_file" ];then
+	sysupgrade_upload_file
+fi
+
+if [ "$op" == "url_upgrade" ];then
+	url_upgrade
+fi
+
+if [ "$op" == "sysupgrade_execute" ];then
+	sysupgrade_execute
+fi
+
+#系统远程升级
+if [ "$op" == "online_upgrade_check" ];then
+	online_upgrade_check
+fi
+
+if [ "$op" == "online_upgrade_apply" ];then
+	online_upgrade_apply
+fi
+
+#系统备份
+if [ "$op" == "sysupgrade_backup" ];then
+	sysupgrade_backup
+fi
+
+if [ "$op" == "sysupgrade_backup_upload" ];then
+	sysupgrade_backup_upload
+fi
+
+if [ "$op" == "sysupgrade_backup_execute" ];then
+	sysupgrade_backup_execute
+fi
+
+if [ "$op" == "reset" ];then
+	sys_reset
+fi
+
+#NTP 时间同步
+if [ "$op" == "get_ntp" ];then
+	get_ntp
+fi
+
+if [ "$op" == "set_ntp" ];then
+	set_ntp
+fi
+
+if [ "$op" == "reboot" ];then
+	sys_reboot
+fi
+
+if [ "$op" == "get_sys_version" ];then
+	get_sys_version
+fi
+
+if [ "$op" == "getAutoreboot" ];then
+	getAutoreboot
+fi
+
+if [ "$op" == "setAutoreboot" ];then
+	setAutoreboot
+fi
+
+#系统工具
+if [ "$op" == "test_ping" ];then
+	test_ping
+fi
+
+if [ "$op" == "test_nslookup" ];then
+	test_nslookup "$FORM_host"
+fi
+
+if [ "$op" == "test_traceroute" ];then
+	test_traceroute  "$FORM_host" "$FORM_ipversion"
+fi
+
+if [ "$op" == "test_wget" ];then
+	test_wget "$FORM_host"
+fi
+
+if [ "$op" == "site_survey" ];then
+	site_survey
+fi
+
+if [ "$op" == "get_days_traffic" ];then
+	get_days_traffic
+fi
+
+if [ "$op" == "refresh_days_traffic" ];then
+	refresh_days_traffic
+fi
+
+#VPN_API
+if [ "$op" == "get_pptp_status" ];then
+	get_pptp_status
+fi
+
+if [ "$op" == "get_pptp_msg" ];then
+	get_pptp_config
+fi
+
+if [ "$op" == "set_pptp" ];then
+	set_pptp_config
+fi
+
+if [ "$op" == "get_l2tp_status" ];then
+	get_l2tp_status
+fi
+
+if [ "$op" == "get_l2tp_msg" ];then
+	get_l2tp_config
+fi
+
+if [ "$op" == "set_l2tp" ];then
+	set_l2tp_config
+fi
+
+if [ "$op" == "get_openvpn_msg" ];then
+	get_openvpn_msg
+fi
+
+if [ "$op" == "get_openvpn_status" ];then
+	get_openvpn_status
+fi
+
+if [ "$op" == "set_openvpn" ];then
+	set_openvpn
+fi
+
+if [ "$op" == "get_n2n" ];then
+	get_n2n
+fi
+
+if [ "$op" == "get_n2n_status" ];then
+	get_n2n_status
+fi
+
+if [ "$op" == "set_n2n" ];then
+	set_n2n
+fi
+
+if [ "$op" == "get_redirect_dnat" ];then
+	get_redirect_dnat
+fi
+
+if [ "$op" == "set_redirect_dnat" ];then
+	set_redirect_dnat
+fi
+
+if [ "$op" == "get_ss_tunnel_info" ];then
+	get_ss_tunnel_info
+fi
+
+
+if [ "$op" == "get_ss_redir" ];then
+	get_ss_redir
+fi
+
+if [ "$op" == "get_mptcp_info" ];then
+	get_mptcp_info
+fi
+
+
+if [ "$op" == "get_ss_dns" ];then
+	get_ss_dns
+fi
+
+
+if [ "$op" == "config_ss_tunnel_server" ];then
+	config_ss_tunnel_server
+fi
+
+
+if [ "$op" == "config_ss_redir" ];then
+	config_ss_redir
+fi
+
+
+if [ "$op" == "config_ss_tunnel_dns" ];then
+	config_ss_tunnel_dns
+fi
+
+if [ "$op" == "enable_mptcp_set" ];then
+	enable_mptcp_set
+fi
+
+if [ "$op" == "app_home" ];then
+	app_home
+fi
+
+if [ "$op" == "get_log_list" ];then
+	get_log_list
+fi
+
+if [ "$op" == "get_samba_info" ];then
+	get_samba_info
+fi
+
+if [ "$op" == "set_samba_info" ];then
+	set_samba_info
+fi
+
+if [ "$op" == "set_samba_status" ];then
+	set_samba_status
+fi
+
+if [ "$op" == "bootflag" ];then
+	bootflag
+fi
+
+if [ "$op" == "setbootflag" ];then
+	setbootflag
+fi
+
+if [ "$op" == "guide_commit" ];then
+	guide_commit
+fi
+
+#SL
+if [ "$op" == "get_pppoe_status" ];then
+	get_pppoe_status
+fi
+
+if [ "$op" == "get_pptp_sl_status" ];then
+	get_pptp_sl_status
+fi
+
+if [ "$op" == "get_l2tp_sl_status" ];then
+	get_l2tp_sl_status
+fi
+
+if [ "$op" == "get_imei" ];then
+	get_imei
+fi
+
+if [ "$op" == "set_imei" ];then
+	set_imei
+fi
+
+if [ "$op" == "get_ttl" ];then
+	get_ttl
+fi
+
+if [ "$op" == "set_ttl" ];then
+	set_ttl
+fi
+
+%>

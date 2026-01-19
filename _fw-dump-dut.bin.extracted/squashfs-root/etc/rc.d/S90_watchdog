@@ -1,0 +1,2 @@
+#!/bin/sh
+/usr/sbin/anywifi/watchsystem_of_dog.sh &

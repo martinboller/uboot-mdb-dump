@@ -1,0 +1,1 @@
+../start_4g_entry.sh

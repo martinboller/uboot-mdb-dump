@@ -1,0 +1,222 @@
+#!/bin/sh
+
+#拨号
+dial()
+{
+	dial_dev=$1
+	section=$2
+	ifname=$3
+	#apn
+	apn_dect=`uci get network.$section.apn_status 2>/dev/null`
+	if [ "${apn_dect}" = "1" ];then
+		config_apn=`uci get network.$section.apn 2>/dev/null`
+		apn=$(at-cmd $dial_dev AT+CGDCONT?|grep "+CGDCONT: 1,\"IP\""|cut -d '"' -f4)
+		if [ "$config_apn" != "" ] && [ "$config_apn" != "$apn" ];then
+			at-cmd $dial_dev AT+CGDCONT=1,\"IP\",\"${apn}\"
+		fi
+	fi
+	ip1=$(ifconfig $ifname |grep Bcast|cut -d: -f2|cut -d' ' -f1)
+	if [ "$ip1" = "" ];then
+		at-cmd $dial_dev AT+CFUN=1
+		at-cmd $dial_dev AT+CGACT=1,1
+		at-cmd $dial_dev AT+ZGACT=1,1
+	fi
+}
+
+#写配置
+config()
+{
+	section=$1
+	ifname=$2
+	uci set network.$section=interface  
+	uci set network.$section.ifname=$ifname
+	uci set network.$section.proto=dhcp
+	uci set network.$section.model=$model
+}
+
+board=`awk 'BEGIN{FS="[ \t]+:[ \t]"} /machine/ {print $2}' /proc/cpuinfo`
+
+#读取模块信息
+atdev="/dev/ttyUSB1"
+vendor=$(at-cmd $atdev AT+CGMI|sed -n '2p'|cut -d':' -f2|sed 's/ //g'|tr -d '\r')
+model=$(at-cmd $atdev AT+CGMR|sed -n '2p'|cut -d':' -f2|sed 's/ //g'|tr -d '\r')
+imei=$(at-cmd $atdev AT+CIMI|sed -n '2p'|cut -d':' -f2|sed 's/ //g'|tr -d '\r')
+if [ "$board" = "ZBT-WE2806" ] || [ $board = "ZBT-WE5928" ];then
+	atdev2="/dev/ttyUSB6"
+	vendor2=$(at-cmd $atdev2 AT+CGMI|sed -n '2p'|cut -d':' -f2|sed 's/ //g'|tr -d '\r')
+	model2=$(at-cmd $atdev2 AT+CGMR|sed -n '2p'|cut -d':' -f2|sed 's/ //g'|tr -d '\r')
+	imei2=$(at-cmd $atdev2 AT+CIMI|sed -n '2p'|cut -d':' -f2|sed 's/ //g'|tr -d '\r')
+fi 
+
+#判断模块配置
+config_model=`uci get network.4g.model 2>/dev/null`
+if [ "$config_model" != "$model" ];then
+	config 4g eth1
+	if [ "$board" = "ZBT-WE2806" ] || [ $board = "ZBT-WE5928" ];then
+		config 4g2 eth2
+		uci set network.4g.metric=10
+		uci set network.4g2.metric=11
+	fi
+	uci commit network
+	/etc/init.d/network reload
+fi
+
+while [ 1 ]
+do
+	imei=$(at-cmd $atdev AT+CIMI|sed -n '2p'|cut -d':' -f2|sed 's/ //g'|tr -d '\r')
+	#读卡
+	iccid=$(at-cmd $atdev AT+ICCID|sed -n '2p'|cut -c 9-28)
+	iccid_len=$(echo ${iccid}|wc -L)
+	if [ $iccid_len != "20" ];then
+		iccid="NO SIM"
+		cpin="None"
+		isp="None"
+		signal="0"
+		echo 0 > /sys/class/leds/sim/brightness
+	else
+		echo 1 > /sys/class/leds/sim/brightness
+		#拨号
+		dial $atdev 4g eth1
+		
+		cpin=$(at-cmd $atdev AT+CPIN?|sed -n '2p'|cut -d ':' -f2|sed 's/ //g'|tr -d '\r')
+		isp=$(at-cmd $atdev AT+COPS?|sed -n '2p'|cut -d '"' -f2)
+		isp_dect=$(echo ${isp}|grep "COPS")
+		if [ -n "${isp_dect}" ];then
+			isp="No Service"
+		fi
+		signal=$(at-cmd $atdev AT+CSQ|sed -n '2p'|sed 's/.*:\(.*$\)/\1/'| cut -d ',' -f 1|sed 's/ //g')
+		if [ "$signal" -le 31 ];then
+			signal=$(printf "%d" $((signal*100/31)))
+		else
+			signal="0"
+		fi
+	fi
+	if [ "$board" = "ZBT-WE2806" ] || [ $board = "ZBT-WE5928" ];then
+		imei2=$(at-cmd $atdev2 AT+CIMI|sed -n '2p'|cut -d':' -f2|sed 's/ //g'|tr -d '\r')
+		#读卡
+		iccid2=$(at-cmd $atdev2 AT+ICCID|sed -n '2p'|cut -c 9-28)
+		iccid2_len=$(echo ${iccid2}|wc -L)
+		if [ $iccid2_len != "20" ];then
+			iccid2="NO SIM"
+			cpin2="None"
+			isp2="None"
+			signal2="0"
+			echo 0 > /sys/class/leds/sim2/brightness
+		else
+			echo 1 > /sys/class/leds/sim2/brightness
+			#拨号
+			dial $atdev2 4g2 eth2
+			
+			cpin2=$(at-cmd $atdev2 AT+CPIN?|sed -n '2p'|cut -d ':' -f2|sed 's/ //g'|tr -d '\r')
+			isp2=$(at-cmd $atdev2 AT+COPS?|sed -n '2p'|cut -d '"' -f2)
+			isp2_dect=$(echo ${isp2}|grep "COPS")
+			if [ -n "${isp2_dect}" ];then
+				isp2="No Service"
+			fi
+			signal2=$(at-cmd $atdev2 AT+CSQ|sed -n '2p'|sed 's/.*:\(.*$\)/\1/'| cut -d ',' -f 1|sed 's/ //g')
+			if [ "$signal2" -le 31 ];then
+				signal2=$(printf "%d" $((signal2*100/31)))
+			else
+				signal2="0"
+			fi
+		fi
+	fi
+	
+	#信号灯
+	if [ $board = "ZBT-WE2806" ] || [ $board = "ZbtlinkZBT-WE2416" ] || [ $board = "ZBT-WE2802D" ] || [ $board = "ZBT-WE2806-A" ];then
+		if [ $signal -ge 75 ];then
+			echo 1 > /sys/class/leds/rssi1/brightness
+			echo 1 > /sys/class/leds/rssi2/brightness
+			echo 1 > /sys/class/leds/rssi3/brightness
+		elif [ $signal -ge 50 ];then
+			echo 1 > /sys/class/leds/rssi1/brightness
+			echo 1 > /sys/class/leds/rssi2/brightness
+			echo 0 > /sys/class/leds/rssi3/brightness
+		elif [ $signal -ge 25 ];then
+			echo 1 > /sys/class/leds/rssi1/brightness
+			echo 0 > /sys/class/leds/rssi2/brightness
+			echo 0 > /sys/class/leds/rssi3/brightness
+		else
+			echo 0 > /sys/class/leds/rssi1/brightness
+			echo 0 > /sys/class/leds/rssi2/brightness
+			echo 0 > /sys/class/leds/rssi3/brightness
+		fi
+	fi
+	if [ "$board" = "ZBT-WE2806" ];then	
+		if [ $signal2 -ge 75 ];then
+			echo 1 > /sys/class/leds/rssi12/brightness
+			echo 1 > /sys/class/leds/rssi22/brightness
+			echo 1 > /sys/class/leds/rssi32/brightness
+		elif [ $signal2 -ge 50 ];then
+			echo 1 > /sys/class/leds/rssi12/brightness
+			echo 1 > /sys/class/leds/rssi22/brightness
+			echo 0 > /sys/class/leds/rssi32/brightness
+		elif [ $signal2 -ge 25 ];then
+			echo 1 > /sys/class/leds/rssi12/brightness
+			echo 0 > /sys/class/leds/rssi22/brightness
+			echo 0 > /sys/class/leds/rssi32/brightness
+		else
+			echo 0 > /sys/class/leds/rssi12/brightness
+			echo 0 > /sys/class/leds/rssi22/brightness
+			echo 0 > /sys/class/leds/rssi32/brightness
+		fi
+	fi
+	
+	#WE2806-A sim卡指示灯
+	if [ $board = "ZBT-WE2806-A" ] || [ $board = "ZBT-WE826-E" ] ;then
+		sim_gpio=`cat /sys/class/gpio/sim/value`
+		if [ $sim_gpio = "1" ];then
+			echo 1 > /sys/class/leds/sim1/brightness
+			echo 0 > /sys/class/leds/sim2/brightness
+			sim="(SIM 1)"
+		else
+			echo 0 > /sys/class/leds/sim1/brightness
+			echo 1 > /sys/class/leds/sim2/brightness
+			sim="(SIM 2)"
+		fi
+	else
+		sim=""
+	fi
+	
+	#4g灯
+	led_4g=`uci get system.led_4g.dev 2>/dev/null`
+	led_4g2=`uci get system.led_4g2.dev 2>/dev/null`
+	if  [ -n "$led_4g" ] && [ "$led_4g" != "eth1" ];then
+		uci set system.led_4g.dev='eth1'
+		uci commit system
+		/etc/init.d/led reload &
+	fi
+	if  [ -n "$led_4g2" ] && [ "$led_4g2" != "eth2" ];then
+		uci set system.led_4g2.dev='eth2'
+		uci commit system
+		/etc/init.d/led reload &
+	fi
+
+#输出json
+cat > /tmp/4ginfo <<EOF
+{
+"device_model":"$vendor $model",
+"imei":"$imei",
+"iccid":"$iccid$sim",
+"pin":"$cpin",
+"isp":"$isp",
+"signal":"$signal",
+"gps":"0"
+}
+EOF
+
+if [ $imei2 != "" ];then
+cat > /tmp/4ginfo2 <<EOF
+{
+"device_model":"$vendor2 $model2",
+"imei":"$imei2",
+"iccid":"$iccid2",
+"pin":"$cpin2",
+"isp":"$isp2",
+"signal":"$signal2"
+}
+EOF
+fi
+	sleep 8
+done
+

@@ -1,0 +1,10 @@
+#!/bin/sh
+section="$(uci show firewall | awk -F '.' '/firewall.set_ttl/ {print $2}')"
+if [ -z "$section" ];then
+	section="$(uci add firewall include)"
+	uci set firewall.${section}.path="/usr/sbin/anywifi/firewall.set_ttl"
+#	uci set firewall.${section}.reload=1
+	uci set firewall.${section}.ttl_cnt=64
+	uci set firewall.${section}.enabled=0
+fi
+uci commit firewall

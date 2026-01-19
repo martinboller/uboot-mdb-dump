@@ -1,0 +1,4 @@
+#!/bin/sh
+chmod +x /etc/init.d/skworker
+/etc/init.d/skworker enable
+rm -rf /etc/uci-defaults/skworker

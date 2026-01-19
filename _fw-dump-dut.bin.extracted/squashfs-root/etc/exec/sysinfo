@@ -1,0 +1,294 @@
+#!/usr/bin/perl
+
+require "/lib/core.cgi";
+
+(my $basename = $0) =~ s/^.*\///;
+$ENV{'PATH'} = '/bin:/sbin:/usr/bin:/usr/sbin';
+
+$| = 1;
+
+my $mymac = &read1line("/sys/class/net/br-lan/address");
+(my $sn = $mymac) =~ s/://g;
+open WT,'>','/tmp/mac.txt' and print WT $sn,"\n" and close WT;
+
+my $model = &read1line('/tmp/sysinfo/model');
+
+my ($ver,$rtime);
+open RD,'<','/etc/os-release';
+while (<RD>) {
+	if (/^BUILD_ID="(\d+)\.(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})"/) {
+		$ver = "$1.$2.$3";
+		$rtime = "20$1-$2-$3 $4:$5:$6";
+	}
+}
+close RD;
+
+if ($ARGV[0] eq 'init') {
+
+	my ($yc_server,$yc_port,$yc_interval) = split(/:/,&read1line('/etc/config/cmcc_server'));
+	$yc_server = 'report.ac-link.com' if (! $yc_server);
+	$yc_port = 10000 if (! $port);
+	$yc_interval = 60 if (! $interval);
+
+	if (-s '/etc/config/cmcc_interval') {
+		$yc_interval = int(&read1line('/etc/config/cmcc_interval')) || 60;
+	}
+
+	open WT,'>','/tmp/yunclient.conf';
+	print WT <<EOF;
+loop_interval $yc_interval
+cmcc_server $yc_server
+cmcc_port $yc_port
+et0macaddr $mymac
+version $ver
+release_time $rtime
+model $model
+wan0_proto dhcp
+wan0_pppoe_username pppoe
+wan0_pppoe_passwd pppoe
+EOF
+	close WT;
+
+	if ($_ = &existsPID('/var/run/yunclient.pid','yunclient')) {
+		system ("kill -9 $_");
+	}
+	&run_as_daemon('/usr/bin/yunclient');	
+}
+
+my $hf_lan = &readsimple('/net/lan');
+
+$hf_lan->{'ip'} = &read1line('/run/cpe_lanip') if (-s '/run/cpe_lanip');
+my $uptime = &gut();
+my $build_time = &read1line('/run/release_time');
+
+my $wifi = {};
+my $radio;
+
+my $iwinfo = (-e '/run/qca' and ! -e '/etc/cpe') ? 'iwconfig' : 'iwinfo';
+foreach (qx|$iwinfo|) {
+	#ra0       ESSID: "MQWRT-464762"
+	if (/^(ra0|wlan0|ath0).*ESSID:\s*"([^"]+)"/) {
+		$wifi->{'radio0'} = { ssid => $2, dev => $1 }; 
+		$radio = 'radio0';
+		next;
+	}
+	elsif (/^(rai0|wlan1|ath1).*ESSID:\s*"([^"]+)"/) {
+		$wifi->{'radio1'} = { ssid => $2, dev => $1 }; 
+		$radio = 'radio1';
+		next;
+	}
+	next if (! $radio);
+	#Bit Rate: 300.0 MBit/s
+	#Mode: Client  Channel: 12 (unknown)
+	if (/^\s+Mode: \S+\s+Channel: (\d+)/) {
+		$wifi->{ $radio }->{'channel'} = $1;
+	}
+
+	## qca iwconfig
+	##   Bit Rate:144.4 Mb/s   Tx-Power:25 dBm
+	if (/^\s+Bit Rate:\S+ \S+\s+Tx\-Power:(\d+) dBm/) {
+		$wifi->{ $radio }->{'txpower'} = $1;
+	}
+}
+
+my $card_3g = -e '/sys/class/net/wwan0' ? 1 : 0;
+my ($sim_card,$can_module,$sdsize,$gps_interval,$p0_state,$p1_state,$p2_state,$p3_state,$p4_state,
+	$card2_3g,$sim2_card);
+
+$can_module = $gps_interval = $p0_state = $p1_state = $p2_state = $p3_state = $p4_state = 0;
+
+if ($card_3g) {
+	my $hf_wwan = &readsimple('/run/4g.info');
+	$sim_card = $hf_wwan->{'imsi'};
+	$card_3g = $hf_wwan->{'device_model'};
+}
+
+my $lan_in = &read1line("/sys/class/net/br-lan/statistics/rx_bytes");
+my $lan_out = &read1line("/sys/class/net/br-lan/statistics/tx_bytes");
+
+my $wifi1_dev = &read1line('/run/wlan0if');
+my $wifi1_in = &read1line("/sys/class/net/$wifi1_dev/statistics/rx_bytes");
+my $wifi1_out = &read1line("/sys/class/net/$wifi1_dev/statistics/tx_bytes");
+
+my $wifi2_dev = &read1line('/run/wlan1if');
+my $wifi2_in = &read1line("/sys/class/net/$wifi2_dev/statistics/rx_bytes");
+my $wifi2_out = &read1line("/sys/class/net/$wifi2_dev/statistics/tx_bytes");
+
+my ($wan_in,$wan_out,$_4g_in,$_4g_out);
+if (-s '/net/wan') {
+	my $hf_wan = &readsimple('/net/wan');
+	$wan_in = &read1line("/sys/class/net/$hf_wan->{'link_dev'}/statistics/rx_bytes");
+	$wan_out = &read1line("/sys/class/net/$hf_wan->{'link_dev'}/statistics/tx_bytes");
+}
+if (-s '/net/wwan0') {
+	my $hf_wwan = &readsimple('/net/wwan0');
+	$_4g_in = &read1line("/sys/class/net/$hf_wwan->{'link_dev'}/statistics/rx_bytes");
+	$_4g_out = &read1line("/sys/class/net/$hf_wwan->{'link_dev'}/statistics/tx_bytes");
+}
+
+my $desc = '';
+my $yunlogin_url = &read1line('/run/yunlogin.web');
+my $yunmgr_id = &read1line('/run/yunmgr_id');
+my $device_desc = &read1line('/run/device_desc');
+
+my $gps_location = -e '/run/gps_location' ? &read1line('/run/gps_location') : '';
+
+my $wan = (-e '/run/wwan_first' and -s '/net/wwan0') ? '/net/wwan0' : (-s '/net/wan') ? '/net/wan' : '';
+my $hf_wan = $wan ? &readsimple($wan) : $hf_lan;
+
+if (-e '/run/qca') {
+	foreach (qx|/usr/sbin/wlanconfig ath0 list|) {
+		++ $wifi->{'radio0'}->{'clients'} if (/^\w\w:/);
+	}
+
+	foreach (qx|/usr/sbin/iwlist ath0 frequency|) {
+		# Current Frequency:2.462 GHz (Channel 11)
+		$wifi->{'radio0'}->{'channel'} = $1 if (/^\s+Current Frequency:\S+ GHz .Channel (\d+)/);
+    }
+
+	if (-e '/sys/class/net/ath1') {
+		foreach (qx|/usr/sbin/wlanconfig ath1 list|) {
+			++ $wifi->{'radio1'}->{'clients'} if (/^\w\w:/);
+		}
+
+		foreach (qx|/usr/sbin/iwlist ath1 frequency|) {
+			# Current Frequency:2.462 GHz (Channel 11)
+			$wifi->{'radio1'}->{'channel'} = $1 if (/^\s+Current Frequency:\S+ GHz .Channel (\d+)/);
+		}
+	}
+}
+elsif (-e '/run/mtk') {
+	
+	my $k = 'ra0';
+    if (-e '/sys/class/net/ra0') {
+        system ("dmesg -c > /dev/null");
+        system ("iwpriv $k show stainfo");
+        system ("dmesg -c > /tmp/$k.stat");
+
+		open RD,'<',"/tmp/$k.stat";
+		## [ 54301.712000] 0C:D7:46:51:4F:F0
+		while (<RD>) {
+			if (/^\[\s*\S+ (\w{2}:\w{2}:\w{2}:\w{2}:\w{2}:\w{2})/){
+				++ $wifi->{'radio0'}->{'clients'};
+				#&_log("found 2.4G client $1 $wifi->{'radio0'}->{'clients'} clients\n");
+			}
+		}
+		close RD;
+	}
+
+	my $k = 'rai0';
+    if (-e '/sys/class/net/rai0') {
+        system ("dmesg -c > /dev/null");
+        system ("iwpriv $k show stainfo");
+        system ("dmesg -c > /tmp/$k.stat");
+
+		open RD,'<',"/tmp/$k.stat";
+		## [54301.712000] 0C:D7:46:51:4F:F0
+		while (<RD>) {
+			++ $wifi->{'radio1'}->{'clients'} if (/^\[\s*\S+ \w{2}:\w{2}:\w{2}:\w{2}:\w{2}:\w{2}/);
+		}
+		close RD;
+	}
+}
+
+my $work_mode = &read1line('/run/work_mode');
+## CPE: 5 => cpe-a  6 => cpe-b
+$work_mode  = "cpe_$work_mode" if (-e '/etc/cpe') ;
+
+my $hf_wm = {
+	route => 0, ap => 1, cpe => 2, repeater => 3, onu => 4, cpe_ap => 5, cpe_bridge => 6
+};
+my $mode = $hf_wm->{ $work_mode } || 0;
+
+## add link_type & msg since 2018/12/24 
+## link_type 上网类型（0=WAN，1=4G）
+## alert_code 告警代码
+my ($alert_code,$link_type,$dfroute);
+
+foreach (qx|/sbin/ip route show table default|) {
+	$dfroute = $1 if (/^default via \S+ dev (\S+)/);
+}
+$link_type = $dfroute =~ /^wwan/ ? 1 : 0;
+
+my @code = ();
+## 4G 未优先时，当前线路是4G 
+if ($dfroute =~ /^wwan/ and ! -e '/run/wwan_first') {
+	push @code,201;
+}
+## 4G 优先时，当前线路是WAN 
+if ($dfroute !~ /^wwan/ and -e '/run/wwan_first') {
+	push @code,202;
+}
+
+foreach (qw/101 102/) {
+	push @code,$_ if (-e "/run/alert.$_");
+}
+
+
+### 103: memusage > 90%
+my $mi = {};
+open MI,'<','/proc/meminfo';
+while (<MI>) {
+    if (/^(MemTotal|MemFree):\s*(\d+)\s*/) {
+        $mi->{ lc($1) }   = $2 ; next;
+    }
+}
+close MI;
+
+push @code,103 if (int(100*$mi->{'memfree'}/$mi->{'memtotal'}) > 90);
+
+### 104: loadavg > 5
+open LA,'<','/proc/loadavg';
+my $loadavg = $1 if (<LA> =~ /^(\S+)/); close LA;
+push @code,104 if ($loadavg >= 5);
+
+
+$alert_code = scalar @code ? join(',',@code) : 0;
+
+if ($alert_code) {
+	open WT,'>','/tmp/alert.code' and print WT $alert_code and close WT;
+}
+else {
+	unlink '/tmp/alert.code';
+}
+
+## wan_rx wan_tx 4g_rx 4g_tx since 2019/01/11
+if (-s '/tmp/flow.today') {
+	my $flow = &read1line('/tmp/flow.today');
+	if ($flow =~ /^(\d+) (\d+) (\d+) (\d+)/) {
+		$wan_in = $1;
+		$wan_out = $2;
+		$_4g_in = $3;
+		$_4g_out = $4;
+	}
+}
+
+
+my $mac2ip = {};
+open ARP,'<','/proc/net/arp';
+while (<ARP>) {
+	if (/^(\S+)\s+\S+\s+0x(\d+)\s+(\S+).*br-lan/ and $2 ne '0') {
+        $mac2ip->{ $3 } = $1;
+    }
+}
+close ARP;
+my $clients = scalar (keys %$mac2ip);
+
+open WT,'>','/tmp/info.txt';
+print WT join(';',$model,$ver,$sn,$uptime,$yunmgr_id,
+	$p0_state,$p1_state,$p2_state,$p3_state,$p4_state,
+	$wifi1_out,$wifi1_in,$wifi2_out,$wifi2_in,$wan_out,$wan_in,$lan_out,$lan_in,$hf_lan->{'ip'},
+	$device_desc,
+	$wifi->{'radio0'}->{'ssid'},$wifi->{'radio0'}->{'channel'},
+	$wifi->{'radio0'}->{'txpower'},$clients,
+	$wifi->{'radio1'}->{'ssid'},$wifi->{'radio1'}->{'channel'},
+	$wifi->{'radio1'}->{'txpower'},$wifi->{'radio1'}->{'clients'},$yunlogin_url,$gps_location,
+	&read1line('/run/manufacture.date'),
+   	&read1line('/run/manufacture.id'),
+   	&read1line('/etc/config/uptime.total'),
+	$hf_wan->{'ip'},
+   	&read1line('/etc/config/inet_uptime.total'),
+   	$mode,$link_type,$alert_code,$_4g_out,$_4g_in
+),"\n";
+close WT;
+

@@ -1,0 +1,9 @@
+
+config info 'device'
+	option detect_host1 '114.114.114.114'
+	option detect_host2 '8.8.8.8'
+	option detect_itv '30'
+	option action 'none'
+	option mobile_priority '0'
+	option ping_count '30'
+

@@ -1,0 +1,9 @@
+#!/bin/sh
+
+[ "${ACTION}" = "released" ] || exit 0
+
+. /lib/functions.sh
+
+echo "$BUTTON pressed for $SEEN seconds" > /tmp/reset
+
+return 0

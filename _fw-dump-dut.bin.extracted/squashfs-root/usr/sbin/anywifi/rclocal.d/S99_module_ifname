@@ -1,0 +1,81 @@
+#!/bin/sh                                                                          
+if [ -e "/var/run/${0##*/}.pid" ] ;then
+	if [ -e "/proc/$(cat /var/run/${0##*/}.pid)" ];then
+		echo "${0##*/} is already running"
+		return 2
+	fi
+fi
+echo "$$" > /var/run/${0##*/}.pid
+
+my_uci_get(){
+        if [ "$(uci get "$1" 2>&1 | grep "Entry not found" | wc -l)" == "1" ];then
+                debug_echo "$1 not found"  1>&2
+        else
+                echo -n "$(uci get "$1")"
+        fi
+}
+
+get_rndsi_cdc_netcard_name()
+{
+	#[    5.894125] cdc_ether 1-1.3:1.4 usb0: register 'cdc_ether' at usb-ehci-platform-1.3, CDC Ethernet Device, 96:91:8e:58
+	cdc_msg="$(dmesg | grep "CDC Ethernet Device")"
+	cdc_ret="$(echo "$cdc_msg" | grep "CDC Ethernet Device" | wc -l)"
+	if [ "$cdc_ret" -ge "1" ];then
+			netcard="$(echo "$cdc_msg" | tail -n 1 | awk -F ']' '{print $2}' | awk '{print $3}' | awk -F ':' '{print $1}' | tr -d '\r')"
+			echo $netcard
+			return
+	fi
+
+	#[   10.334860] rndis_host 1-1.3:1.0 eth2: register 'rndis_host' at usb-ehci-platform-1.3, RNDIS device, 00:a0:c6:00:00:0
+	rndis_msg="$(dmesg | grep "RNDIS device")"
+	rndis_ret="$(echo "$rndis_msg" | grep "RNDIS device" | wc -l)"
+	if [ "$rndis_ret" -ge "1" ];then
+			netcard="$(echo "$rndis_msg" | tail -n 1 | awk -F ']' '{print $2}' | awk '{print $3}' | awk -F ':' '{print $1}')"
+			echo $netcard
+			return
+	fi
+	
+	qmi_msg="$(dmesg | grep -w "WWAN/QMI device" | wc -l)"
+	if [ "$qmi_msg" -ge "1" ];then
+			netcard="$(dmesg | grep -w "WWAN/QMI device"| tail -n 1 | awk -F ']' '{print $2}' | awk '{print $3}' | awk -F ':' '{print $1}')"
+			echo $netcard
+			return
+	fi
+
+	gobinet_msg="$(dmesg | grep -i gobinet | grep "Ethernet Device" | wc -l)"
+	if [ "$gobinet_msg" -ge "1" ];then
+		netcard="$(dmesg | grep -i gobinet | grep "Ethernet Device" | tail -n 1 | awk -F ': register' '{print $1}' | awk '{print $NF}')"
+		echo $netcard
+		return
+	fi
+
+	cdc_ncm_msg="$(dmesg | grep "CDC NCM" | grep -w register)"
+	cdc_ncm_ret="$(echo "$cdc_ncm_msg" | grep "cdc_ncm" | wc -l)"
+	if [ "$cdc_ncm_ret" -ge "1" ];then
+		netcard="$(echo "$cdc_ncm_msg" | tail -n 1 | awk -F ']' '{print $2}' | awk -F ': register' '{print $1}' | awk '{print $NF}')"
+		echo $netcard
+		return
+	fi
+
+	simcom_wwan_msg="$(dmesg | grep "wwan" | grep -w register)"
+	simcom_wwan_ret="$(echo "$simcom_wwan_msg" | grep "wwan" | wc -l)"
+	if [ "$simcom_wwan_ret" -ge "1" ];then
+		netcard="$(echo "$simcom_wwan_msg" | tail -n 1 | awk -F ']' '{print $2}' | awk -F ': register' '{print $1}' | awk '{print $NF}')"
+		echo $netcard
+		return
+	fi
+
+	echo "none"
+}
+
+for i in $(seq 1 50)
+do
+	module_ifname="$(get_rndsi_cdc_netcard_name)"
+	if [ "$module_ifname" != none ];then
+		echo "$module_ifname" > /tmp/module_ifname
+		break
+	fi
+	echo "$module_ifname" > /tmp/module_ifname
+	sleep 1
+done
+

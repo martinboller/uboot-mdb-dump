@@ -1,0 +1,87 @@
+#!/bin/sh
+
+[[ "$(pidof ${0##*/} | wc -w)" -gt "2" ]] && echo "Already running ..." && return 2
+ 
+debug=$(echo $@ | grep "\-\-debug" | wc -l)
+debug_echo(){ if [[ "$debug" == "1" ]];then message="$(date +%s) $1"; echo "$message" 1>&2; logger "$message";fi }
+ 
+my_uci_get(){
+        if [ "$(uci get "$1" 2>&1 | grep "Entry not found" | wc -l)" == "1" ];then
+                debug_echo "$1 not found"  1>&2                                    
+        else                        
+                echo -n "$(uci get "$1")"
+        fi                       
+}
+
+log_write(){
+	local LOG_PATH=/www/log_list
+	log_date="$(date "+%Y-%m-%d %H:%M:%S")"
+	log_content="$1"
+	log_line="$log_date $log_content"
+	log_num="$(wc -l "$LOG_PATH" | awk '{print $1}')"
+	[ -e "$LOG_PATH" ] || echo "$log_date sys:\"Start logging\"" > "$LOG_PATH"
+	if [ "$log_num" -gt 100 ];then
+		debug_echo "$LOG_PATH is too big  = $log_num"
+		sed -i "1i $log_line" "$LOG_PATH"
+		sed -i '101,$d' "$LOG_PATH"
+	else
+		debug_echo "$LOG_PATH is right = $log_num"
+		sed -i "1i $log_line" "$LOG_PATH"
+	fi
+	debug_echo "$log_line"
+	return 0
+}
+
+####
+LOCK_FILE="/tmp/NTPD_timeAlreadySyncd"
+dir_name="/usr/sbin/anywifi/ntpd.d"
+ntp_enabled="$(uci -q get system.ntp.enabled)"
+if [ "$ntp_enabled" != 1 ];then
+	debug_echo "ntp disable quit"
+	exit
+fi
+
+if [ -f "$LOCK_FILE" ];then
+	debug_echo "Time already syncd, quit"
+	exit
+else
+	debug_echo "Start to time sync"
+fi
+
+ntp_servers="$(my_uci_get system.ntp.server)"
+debug_echo "Get ntpserver from /etc/config/system and it's : $ntp_servers "
+
+ntpd_cmd="ntpd -n -d -q "
+for ntp_server in $ntp_servers ;do
+	ntpd_cmd="${ntpd_cmd} -p $ntp_server"
+done
+
+debug_echo "NTPD cmd is: $ntpd_cmd"
+
+ntp_server_ret="$($ntpd_cmd 2>&1)"
+debug_echo "Ntp sever return is: $ntp_server_ret"
+
+offset="$(echo "$ntp_server_ret" | grep "offset" | awk 'NR==1' | awk -F 'offset' '{print $2}' | awk -F' ' '{print $1}' | tr -d ':+-')"
+debug_echo "Offset is $offset"
+
+if [ -z "$offset" ];then
+	debug_echo "Time server not return , wait for next loop"
+	exit
+fi
+
+if [ -n "$(echo "$offset" | grep -E "^0.")" ];then
+	debug_echo "Time already syncd"
+	uci set anywifi.internet.timesyncd='1' >/dev/null 2>&1
+	(log_content="ether:\"ntp syncd success\"";log_write "$log_content") >/dev/null 2>&1
+	touch ${LOCK_FILE}
+else
+	debug_echo "Time syncd"
+	touch ${LOCK_FILE}
+	#Trigger an event for timesysnc in /usr/sbin/anywifi/ntpd.d/
+	for filename_fullpath in $dir_name/* ;do
+		${filename_fullpath} &
+	done
+	#for HTTP based timeSyncd module, check_internet
+	uci set anywifi.internet.timesyncd='1' >/dev/null 2>&1
+	(log_content="ether:\"ntp syncd success\"";log_write "$log_content") >/dev/null 2>&1
+fi

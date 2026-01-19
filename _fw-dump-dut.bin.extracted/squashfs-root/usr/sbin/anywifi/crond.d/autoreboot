@@ -1,0 +1,48 @@
+#!/bin/sh
+
+[[ "$(pidof ${0##*/} | wc -w)" -gt "2" ]] && echo "$0 Already running ..." && return 2
+ 
+debug=$(echo $@ | grep "\-\-debug" | wc -l)
+debug_echo(){ if [[ "$debug" == "1" ]];then message="$(date +%s) $1"; echo "$message" 1>&2; logger "$message" >/dev/null 2>&1;fi }
+
+my_uci_get(){
+        if [ "$(uci get "$1" 2>&1 | grep "Entry not found" | wc -l)" == "1" ];then
+                debug_echo "$1 not found"  1>&2
+        else
+                echo -n "$(uci get "$1")"
+        fi
+}
+
+hour_current=$(date +%H)
+minute_current=$(date +%M)
+weekdays_current="$(date | awk '{print $1}')"
+
+enabled_uci="$(my_uci_get autoreboot.main.enabled)"
+hour_uci="$(my_uci_get autoreboot.main.hour)"
+minute_uci="$(my_uci_get autoreboot.main.minute)"
+weekdays_uci="$(my_uci_get autoreboot.main.weekdays)"
+weekdays_judge="$(echo "$weekdays_uci" | grep -ow "$weekdays_current")"
+
+if [[ "$enabled_uci" != "1" ]];then
+	debug_echo "Auto reboot not enabled, just quit"
+	exit
+else
+	debug_echo "Auto reboot enabled, start to work"
+fi
+
+debug_echo "Current hour is $hour_current , Current minute is $minute_current , Current weekdays $weekdays_current"
+debug_echo "Setting hour is $hour_uci , Setting minute is $minute_uci , Setting weekdays is $weekdays_uci"
+debug_echo "weekdays_judge is $weekdays_judge"
+
+if [[ "$hour_current" == "$hour_uci" && "$minute_current" == "$minute_uci" ]] && [ -n "$weekdays_judge" ];then
+	uptime="$(cat /proc/uptime | awk -F. '{print $1}')"
+	#At least 5 mins
+	if [[ $uptime -gt 300 ]];then
+		debug_echo "Time same and uptime is $uptime , start to reboot"
+		reboot
+	else
+		debug_echo "Time same but uptime is $uptime , do nothing"
+	fi
+else
+	debug_echo "Time not same, do nothing"
+fi

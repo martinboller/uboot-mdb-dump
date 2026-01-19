@@ -1,0 +1,92 @@
+#!/bin/sh
+if [ -e "/var/run/${0##*/}.pid" ] ;then
+	if [ -e "/proc/$(cat /var/run/${0##*/}.pid)" ];then
+		echo "${0##*/} is already running"
+		return 2
+	fi
+fi
+ 
+debug=$(echo $@ | grep "\-\-debug" | wc -l)
+debug_echo(){ if [[ "$debug" == "1" ]];then message="$(date +%s) $1"; echo "$message" 1>&2; logger "$message";fi }
+
+LOG_PATH=/www/log_list
+ 
+my_uci_get(){
+        if [ "$(uci get "$1" 2>&1 | grep "Entry not found" | wc -l)" == "1" ];then
+                debug_echo "$1 not found"  1>&2                                    
+        else                        
+                echo -n "$(uci get "$1")"
+        fi                       
+}
+
+log_write(){
+	log_date="$(date "+%Y-%m-%d %H:%M:%S")"
+	log_content="$1"
+	log_line="$log_date $log_content"
+	log_num="$(wc -l "$LOG_PATH" | awk '{print $1}')"
+	[ -e "$LOG_PATH" ] || echo "$log_date sys:\"Start logging\"" > "$LOG_PATH"
+	if [ "$log_num" -gt 100 ];then
+		debug_echo "$LOG_PATH is too big  = $log_num"
+		sed -i "1i $log_line" "$LOG_PATH"
+		sed -i '101,$d' "$LOG_PATH"
+	else
+		debug_echo "$LOG_PATH is righet = $log_num"
+		sed -i "1i $log_line" "$LOG_PATH"
+	fi
+	debug_echo "$log_line"
+	return 0
+}
+####
+
+wan_proto="$(my_uci_get network.wan.proto)"
+lan_ipaddr="$(my_uci_get network.lan.ipaddr)"
+wan_ifname="$(my_uci_get network.wan.ifname)"
+wan_ipaddr="$(ifconfig "$wan_ifname"| grep "inet addr:" | awk -F ":" '{print $2}' | awk '{print $1}')"
+lan_change_judge=0
+ApCliEnable="$(my_uci_get wireless.default_radio0.ApCliEnable)"
+wifi_change_judge="$((ApCliEnable^0))"
+
+if [ "$wifi_change_judge" == 1 ];then
+	wifi_ipaddr="$(ifconfig apcli0 | awk '/inet addr/{print  $2}' | awk -F ':' '{print $2}')"
+	if [ -z "$wifi_ipaddr" ];then
+		debug_echo "no get wifi ip,try again"
+		sleep 5
+		wifi_ipaddr="$(ifconfig apcli0 | awk '/inet addr/{print  $2}' | awk -F ':' '{print $2}')"
+		if [ -z "$wifi_ipaddr" ];then
+			debug_echo "no get wifi ip,try again"
+			sleep 5
+		fi
+		wifi_ipaddr="$(ifconfig apcli0 | awk '/inet addr/{print  $2}' | awk -F ':' '{print $2}')"
+	fi
+	while [ "${wifi_ipaddr%.*}" == "${lan_ipaddr%.*}" ];do
+		lan_change_judge=1
+		lan_ipaddr="$(echo "$lan_ipaddr" | awk  'BEGIN{FS=".";OFS="."}{$3+=1;$3%=256;print $0}')"
+	done
+fi
+
+if [ "$wan_proto" == "dhcp" ];then
+	while [ "${wifi_ipaddr%.*}" == "${lan_ipaddr%.*}" -o "${wan_ipaddr%.*}" == "${lan_ipaddr%.*}" ];do
+		lan_change_judge=1
+		lan_ipaddr="$(echo "$lan_ipaddr" | awk  'BEGIN{FS=".";OFS="."}{$3+=1;$3%=256;print $0}')"
+	done
+fi
+
+if [ "$lan_change_judge" == 1 ];then
+	debug_echo "wan_ipaddr=$wan_ipaddr wifi_ipaddr=${wifi_ipaddr} and set lan_ipaddr=$lan_ipaddr"
+	uci set network.lan.ipaddr="$lan_ipaddr"
+	uci commit network
+	dhcp_map_ip="my_uci_get dhcp.@dnsmasq[0].address | awk -F '/' '{print $3}'"
+	if [ "$lan_ipaddr" != "$dhcp_map_ip" ];then
+		uci delete dhcp.@dnsmasq[0].address
+		uci add_list dhcp.@dnsmasq[0].address="/router.epplink.net/${lan_ipaddr}"
+		uci commit dhcp
+		/etc/init.d/dnsmasq restart
+	fi
+	log_content="net:\"wan network segment or wireless network segment is same lan network segment = ${wan_ipaddr%.*} ,so set lan ip = $lan_ipaddr\""
+	log_write "$log_content"
+#	(/etc/init.d/network restart) &
+#	(wifi) &
+	reboot
+	return 0
+fi
+

@@ -1,0 +1,256 @@
+#!/bin/sh
+
+[[ "$(pidof ${0##*/} | wc -w)" -gt "2" ]] && echo "Already running ..." && return 2
+
+. /usr/sbin/anywifi/dial_common.sh
+
+atdev="/dev/$(awk -F ' ' '{print $4}' /tmp/mobile_module_name.txt)"
+ifname="$(get_rndsi_cdc_netcard_name)"
+section="4gwan"
+
+dial()
+{
+	debug_echo "Ec20 script : set apn and active PDP"
+	apn="$(my_uci_get network.$section.apn)"
+	username="$(my_uci_get network.$section.username)"
+	password="$(my_uci_get network.$section.password)"
+	pin="$(my_uci_get network.$section.pin)"
+	(quectel-CM -4 -s "$apn" ${username} ${password} ${pin:+\-p $pin} 1>/dev/null 2>&1) &
+}
+
+#写配置
+config()
+{
+	uci set network.${section}=interface
+	uci set network.${section}.ifname=${ifname}
+	uci set network.${section}.proto=dhcp
+	uci set network.${section}.metric=5
+	uci set network.wan.metric=3
+	uci commit network
+}
+
+down_and_delete_config()
+{
+	killall_process quectel-CM
+	ret="$(at-cmd $atdev AT+CGATT=0)"
+	sleep 3
+	debug_echo "Ec20 script : down $ifname $ret"
+}
+
+ppp_mode="$(my_uci_get network.${section}.proto)"
+if [ "$ppp_mode" == "3g" ];then
+	debug_echo "ppp dial mode, close current mode and break"
+	exit
+fi
+
+while [ ! -f /tmp/module_ifname ]
+do
+	/usr/sbin/anywifi/rclocal.d/S99_module_ifname &
+	sleep 2
+done
+ifname="$(cat /tmp/module_ifname)"
+while [ "$ifname" == none ]
+do
+	ifname="$(cat /tmp/module_ifname)"
+	sleep 5
+done
+#判断模块配置
+set_firewall "$section"
+config_judge=0
+[ "$(uci -q get network.4gwan)" == "interface" ] || config_judge=1
+[ "$(uci -q get network.4gwan.ifname)" == "$ifname" ] || config_judge=1
+[ "$(uci -q get network.4gwan.proto)" == "dhcp" ] || config_judge=1
+[ -n "$(uci -q get network.4gwan.metric | grep -w "[0-9]\+")" ] || config_judge=1
+[ -n "$(uci -q get network.wan.metric | grep -w "[0-9]\+")" ] || config_judge=1
+[ "$(uci -q get network.wan.metric)" != "$(uci -q get network.4gwan.metric)" ] || config_judge=1
+if [ "$config_judge" == 1 ];then
+	config
+	debug_echo "reate $section network config"
+	ifup wan
+	ifup "$section"
+	dial
+fi
+
+ping_sh_pid="$(ps -w | grep "/usr/sbin/anywifi/manual_dial/module_ping.sh" | grep -v "grep" | awk '{print $1}')"
+if [ -z "$ping_sh_pid" ];then
+	/usr/sbin/anywifi/manual_dial/module_ping.sh $ifname &
+fi
+trap "restart_4g_module $atdev $section" USR1
+trap "dial" USR2
+first_dial=1
+while [ 1 ]
+do
+	ttyUSB="$(ls /dev/ttyUSB* | wc -l)"
+	if [ "$ttyUSB" == "0" ];then
+		debug_echo "Ec200t script : There is no /dev/ttyUSB*"
+		sleep 10
+		continue
+	fi
+	ppp_mode="$(my_uci_get network.4gwan.proto)"
+	if [ "$ppp_mode" == "3g" ];then
+		debug_echo "quectel_ec20_ec25 script : ppp dial mode, close current mode and break"
+		down_and_delete_config
+		break
+	fi
+	at_judge="$(at-cmd $atdev at | grep 'OK')"
+	if [ -z "$at_judge" ];then
+		sleep 2
+		debug_echo "NOT AT OK"
+		continue
+	fi
+
+	ret=$(at-cmd $atdev ati)
+	vendor=$(echo "${ret}" | sed -n '2p' | tr -d '\r')
+	model=$(echo "${ret}" | sed -n '3p' | tr -d '\r')
+	version=$(echo "${ret}" | sed -n '4p' | awk '{print $2}' | tr -d '\r')
+	imei=$(at-cmd $atdev AT+GSN | sed -n '2p'| tr -d '\r')
+	cpin=$(at-cmd $atdev at+cpin? | sed -n '2p' | awk -F ': ' '{print $2}' | tr -d '\r')
+
+	#just iccid
+	iccid=$(at-cmd $atdev AT+ICCID | sed -n '2p'| cut -c 9-28)
+	iccid_len=$(echo ${iccid} | wc -L)
+	if [ $iccid_len != "20" ] && [ $iccid_len != "19" ];then
+		iccid="NO SIM"
+		#cpin="None"
+		isp="None"
+		signal="0"
+	fi
+
+	#get isp
+	isp=$(at-cmd $atdev AT+COPS? | sed -n '2p' | cut -d '"' -f2)
+	isp_dect=$(echo ${isp} | grep "COPS")
+	if [ -n "${isp_dect}" ];then
+		cops="No Service"
+		debug_echo "Ec20 script : not get isp"
+		cimi=$(at-cmd $atdev at+cimi | sed -n '2p' |cut -c 0-5)
+		if [ "$cimi" == "46011" ] || [ "$cimi" == "46003" ];then
+			qnvfr=$(at-cmd $atdev AT+QNVFR=\"nv/item_files/modem/mmode/operator_name\")
+			qnvfr_error="$(echo "$qnvfr" | grep -i ERROR)"
+			qnvfr_operator=$(echo "$qnvfr" | grep QNVFR |sed -n '2p' |cut -d ':' -f2 | sed 's/ //g' | tr -d '\r')
+			if [ -z "$qnvfr_error" ] && [ "$qnvfr_operator" != "00" ] && [ -n "$qnvfr_operator" ];then
+				at-cmd $atdev AT+QNVFW=\"nv/item_files/modem/mmode/operator_name\",00
+				at-cmd $atdev AT+CFUN=1,1
+				continue
+			fi
+		fi
+	else
+		cops="$isp"
+	fi
+
+	#get signal
+	qeng="$(at-cmd $atdev AT+QENG=\"servingcell\")"
+	net_type="$(echo "$qeng" | sed -n '2p' | awk -F ':' '{print $2}' | awk -F ',' '{print $3}' | tr -d '"\r')"
+	net_line="$(echo "$qeng" |  grep "+QENG:" | wc -l)"
+	if [ "$net_type" == "NR5G-SA" ];then
+		rsrp="$(echo "$qeng" | sed -n '2p' | awk -F ':' '{print $2}' | awk -F ',' '{print $13}' | tr -d '"\r')"
+	elif [ "$net_line" == 3 ];then
+		net_type=NR5G-NSA
+		rsrp="$(echo "$qeng" | sed -n '3p' | awk -F ':' '{print $2}' | awk -F ',' '{print $12}' | tr -d '"\r')"
+	elif [ "$net_type" == "LTE" ];then
+		rsrp="$(echo "$qeng" | sed -n '2p' | awk -F ':' '{print $2}' | awk -F ',' '{print $14}' | tr -d '"\r')"
+	elif [ "$net_type" == "WCDMA" ];then
+		rsrp="$(echo "$qeng" | sed -n '2p' | awk -F ':' '{print $2}' | awk -F ',' '{print $11}' | tr -d '"\r')"
+	fi
+
+	if [ "$rsrp" -ge "-44" ];then
+		signal=100
+	elif [ "$rsrp" -ge "-85" ];then
+		csq_temp=80
+		csq_rsrp=$(printf "%d" $((($rsrp-(-85))*20/41)))
+		signal=$(expr $csq_temp + $csq_rsrp)
+	elif [ "$rsrp" -ge "-95" ];then
+		csq_temp=60
+		csq_rsrp=$(printf "%d" $((($rsrp-(-95))*20/10)))
+		signal=$(expr $csq_temp + $csq_rsrp)
+	elif [ "$rsrp" -ge "-105" ];then
+		csq_temp=40
+		csq_rsrp=$(printf "%d" $((($rsrp-(-105))*20/10)))
+		signal=$(expr $csq_temp + $csq_rsrp)
+	elif [ "$rsrp" -ge "-115" ];then
+		csq_temp=20
+		csq_rsrp=$(printf "%d" $((($rsrp-(-115))*20/10)))
+		signal=$(expr $csq_temp + $csq_rsrp)
+	elif [ "$rsrp" -lt "-115" ];then
+		csq_temp=0
+		csq_rsrp=$(printf "%d" $((($rsrp-(-140))*20/25)))
+		signal=$(expr $csq_temp + $csq_rsrp)
+	else
+		signal=
+	fi
+
+	debug_echo "rsrp=$rsrp csq_rsrp=$csq_rsrp csq_temp=$csq_temp"
+	imsi="$(at-cmd $atdev at+cimi | sed -n '2p' | tr -d '\r')"
+	if [ "$(echo $imsi | wc -L)" != "15" ];then
+		imsi=""
+	fi
+
+	cgreg=$(at-cmd $atdev at+cgreg? | sed -n '2p' | sed 's/+CGREG: .,//g' | tr -d '\r')
+	case $cgreg in
+		1)
+			cgreg="Registered OK"
+			;;
+		2)
+			cgreg="Registering..."
+			;;
+		*)
+			cgreg="Not registered"
+			;;
+	esac
+
+	apn=$(at-cmd $atdev at+cgdcont? | grep "+CGDCONT: 1" | awk -F '"' '{print $4}')
+	usbnet=$(at-cmd $atdev AT+QCFG=\"usbnet\" | grep "+QCFG:" | tr -d '\r')
+	ret="$(ping_test $ifname)"
+	if [ "$ret" == "0" ];then
+		cgreg="Registered OK"
+	fi
+#	disabled_sa="$(at-cmd $atdev AT+QNWPREFCFG=\"nr5g_disable_mode\" | awk -F ',' '/\+QNWPREFCFG:/{print $2}' | tr -d '\r')"
+#	[ $disabled_sa != 1 ] && mode_tmp=$(at-cmd $atdev AT+QNWPREFCFG=\"nr5g_disable_mode\",1)
+
+	debug_echo "Ec20 script : update 4ginfo > /tmp/4ginfo"
+
+#输出json
+cat > /tmp/4ginfo <<EOF
+{
+"device_model":"$vendor $model",
+"version":"$version",
+"sim_status":"$cpin",
+"signal":"$signal",
+"iccid":"$iccid",
+"imsi":"$imsi",
+"imei":"$imei",
+"cops":"$cops",
+"cgreg":"$cgreg",
+"apn":"$apn",
+"net_type":"$net_type",
+"usbnet":"$usbnet"
+}
+EOF
+	# get sim status ，实现热插拔sim
+	if [ "$cpin" != "READY" ];then
+		debug_echo "cpin:$cpin != READY "
+		killall_process quectel-CM
+		restart_4g_module "$atdev" "$section"
+		cnt=0
+		debug_echo "sleep 8"
+		sleep 8
+		continue
+	fi
+	# get 4gwan status
+	ret="$(ping_test $ifname)"
+	sleep 1
+	stat_4g="$(ifconfig $ifname | sed -n '2p' | grep "inet addr" | wc -l)"
+	if [ "$stat_4g" == "0" -o "$ret" == "1" -o "$first_dial" == 1 ];then
+		first_dial=0
+#		killall_process quectel-CM
+		ifup "$section"
+		cnt=$((cnt+1))
+		dial
+		debug_echo "exec $section diag and ifup $section"
+	else
+		cnt=0
+	fi
+	debug_echo "sleep 8"
+	sleep 8
+	[ "$cnt" -ge "4" ] && cnt=0 && debug_echo "dial fial 4 times" && restart_4g_module $atdev $section
+done
+

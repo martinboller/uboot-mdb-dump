@@ -1,0 +1,53 @@
+#!/bin/sh
+if [ -e "/var/run/${0##*/}.pid" ] ;then
+	if [ -e "/proc/$(cat /var/run/${0##*/}.pid)" ];then
+		echo "${0##*/} is already running"
+		return 2
+	fi
+fi
+echo "$$" > /var/run/${0##*/}.pid
+
+debug=$(echo $@ | grep "\-\-debug" | wc -l)
+debug_echo(){ if [[ "$debug" == "1" ]];then message="$(date +%s) $1"; echo "$message" 1>&2; logger "$message" >/dev/null 2>&1;fi }
+
+my_uci_get(){
+        if [ "$(uci get "$1" 2>&1 | grep "Entry not found" | wc -l)" == "1" ];then
+                debug_echo "$1 not found"  1>&2                                        
+        else                            
+                echo -n "$(uci get "$1")"
+        fi                           
+}
+
+start(){
+	wifi_device_list="$(uci show wireless | sed -n 's/wireless.\(.*\)=wifi-device/\1/p')"
+	for wifi_device in $wifi_device_list
+	do
+		i=0
+		if [ "$wifi_device" == "mt7628" -o "$wifi_device" == "mt7603e" -o "$wifi_device" == "mt7620" ];then
+			wifi_iface_head="ra"
+		elif [ "$wifi_device" == "mt7663" -o "$wifi_device" == "mt7612e" ];then
+			wifi_iface_head="rai"
+		else
+			break
+		fi
+		wifi_iface_list="$(uci show wireless | awk -F "." '/device='\'$wifi_device\''/{print $2}')"
+		for wifi_iface in $wifi_iface_list
+		do
+			wifi_ifname="$(uci -q get wireless.${wifi_iface}.ifname)"
+			[ -z "$wifi_ifname" ] && wifi_ifname="${wifi_iface_head}${i}"
+			wifi_judge="$(uci -q get wireless.${wifi_iface}.disabled)"
+			wifi_judge="$((wifi_judge ^ 0))"
+			brctl_judge="$(brctl show | grep -w "$wifi_ifname")"
+			if [ "$wifi_judge" == 0 -a -z "$brctl_judge" ];then
+				wifi_network="$(uci -q get wireless.${wifi_iface}.network)"
+				wifi_network="br-${wifi_network:-lan}"
+				debug_echo "add wifi_ifname $wifi_ifname to $wifi_network"
+				brctl addif "$wifi_network" "$wifi_ifname"
+			else
+				debug_echo "wifi_ifname $wifi_ifname not use brctl"
+			fi
+			i="$((i + 1))"
+		done
+	done
+}
+start

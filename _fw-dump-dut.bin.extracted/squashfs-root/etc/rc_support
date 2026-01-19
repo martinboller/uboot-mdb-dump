@@ -1,0 +1,6 @@
+## rc_support defination for zbt device
+
+mt7620 			= mtk mt7620
+zbt-we826-t 	= @mt7620
+zbt-we826-wd 	= @mt7620 hwdog
+zbt-cpe102 		= @mt7620 cpe

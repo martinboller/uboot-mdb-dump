@@ -1,0 +1,104 @@
+#!/bin/sh
+
+[[ "$(pidof ${0##*/} | wc -w)" -gt "2" ]] && echo "Already running ..." && return 2
+ 
+debug=$(echo $@ | grep "\-\-debug" | wc -l)
+debug_echo(){ if [[ "$debug" == "1" ]];then message="$(date +%s) $1"; echo "$message" 1>&2; logger "$message";fi }
+ 
+my_uci_get(){
+        if [ "$(uci get "$1" 2>&1 | grep "Entry not found" | wc -l)" == "1" ];then
+                debug_echo "$1 not found"  1>&2                                    
+        else                        
+                echo -n "$(uci get "$1")"
+        fi                       
+}
+
+
+module_type="ec20"
+at_port="/dev/ttyUSB2"
+#ret="$(comgt -d $at_port -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat)"
+#debug_echo "Comgt return is: $ret"
+
+sim_status_uci="$(my_uci_get 4gstatus.info.sim_status)"
+sim_signal_uci="$(my_uci_get 4gstatus.info.sim_signal)"
+
+debug_echo "Start to check SIM status"
+ret_sim="$(comgt -d $at_port -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.sim)"
+while [ "$ret_sim" = "" ] || [ -z "$(echo "$ret_sim" | grep "CPIN:")" ];do
+	debug_echo "Ret_sim has no CPIN info,loop again"
+	uci set 4gstatus.info.sim_status=0
+	uci set 4gstatus.info.sim_signal="0,99"
+	uci set 4gstatus.info.sim_imei=""
+	uci set 4gstatus.info.sim_ismi=""
+	uci set 4gstatus.info.sim_iccid=""
+	uci set 4gstatus.info.sim_qnwinfo=""
+	ret_sim="$(comgt -d $at_port -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.sim)"
+	sleep 5
+done
+debug_echo "Comgt return is: $ret_sim"
+
+if [ -n "$(echo "$ret_sim" | grep "+CPIN: READY")" ];then
+	debug_echo "Ret_sim has +CPIN: READY set sim_status=1"
+	uci set 4gstatus.info.sim_status=1
+fi
+
+
+#+CSQ: 23,99
+ret_csq="$(comgt -d $at_port -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.csq)"
+while [ "$ret_csq" = "" ] || [ -z "$(echo "$ret_csq" | grep "CSQ:")" ];do
+	ret_csq="$(comgt -d $at_port -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.csq)"
+	sleep 5
+done
+
+debug_echo "Signal get and return is $ret_csq"
+sim_signal="$(echo "$ret_csq" | awk -F: '/CSQ/{print $2}' | tr -d ' ')"
+uci set 4gstatus.info.sim_signal="$sim_signal"
+debug_echo "Set signal to $sim_signal"
+
+#+CCID: 89860114840501378346
+ret_iccid="$(comgt -d $at_port -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.iccid)"
+while [ "$ret_iccid" = "" ] || [ -z "$(echo "$ret_iccid" | grep "CCID:")" ];do
+	ret_iccid="$(comgt -d $at_port -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.iccid)"
+	sleep 5
+done
+debug_echo "ICCID get is $ret_iccid"
+sim_iccid="$(echo "$ret_iccid" | awk -F: '/CCID:/{print $2}' | tr -d ' ')"
+uci set 4gstatus.info.sim_iccid="$sim_iccid"
+debug_echo "ICCID is $sim_iccid"
+
+#IMSI
+#460010409814495
+ret="$(comgt -d $at_port -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.imsi)"
+debug_echo "IMSI get from comgt is $ret"
+while [ "$ret" = "" ] || [ -z "$(echo "$ret" | awk 'NR==2{print}')" ];do
+	ret="$(comgt -d $at_port -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.imsi)"
+	sleep 5
+done
+debug_echo "IMSI get is $ret"
+sim_imsi="$(echo "$ret" | awk 'NR==2{print}' | tr -d ' ')"
+uci set 4gstatus.info.sim_imsi="$sim_imsi"
+debug_echo "IMSI is $sim_imsi"
+
+#IMEI
+ret="$(comgt -d $at_port -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.imei)"
+while [ "$ret" = "" ] || [ -z "$(echo "$ret" | awk 'NR==2{print}')" ];do
+	ret="$(comgt -d $at_port -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.imei)"
+	sleep 5
+done
+debug_echo "IMEI get from comgt is $ret"
+sim_imei="$(echo "$ret" | awk 'NR==2{print}')"
+debug_echo "SIM_IMEI is $sim_imei"
+uci set 4gstatus.info.sim_imei="$sim_imei"
+
+#QNWINFO
+ret="$(comgt -d $at_port -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.qnwinfo)"
+while [ "$ret" = "" ] || [ -z "$(echo "$ret" | grep '+QNWINFO:')" ];do
+	debug_echo "Qnwinfo get failed try again"
+	ret="$(comgt -d $at_port -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.qnwinfo)"
+	sleep 5
+done
+
+debug_echo "QNWINFO get from comgt is $ret"
+sim_qnwinfo="$(echo "$ret" | awk -F: '/QNWINFO:/{print $2}' | tr -d ' ')"
+debug_echo "SIM_IMEI is $sim_qnwinfo"
+uci set 4gstatus.info.sim_qnwinfo="$sim_qnwinfo"

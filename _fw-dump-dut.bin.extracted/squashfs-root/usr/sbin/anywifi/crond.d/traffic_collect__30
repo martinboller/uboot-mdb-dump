@@ -1,0 +1,211 @@
+#!/bin/sh
+if [ -e "/var/run/${0##*/}.pid" ] ;then
+	if [ -e "/proc/$(cat /var/run/${0##*/}.pid)" ];then
+		echo "${0##*/} is already running"
+		return 2
+	fi
+fi
+echo "$$" > /var/run/${0##*/}.pid
+
+debug=$(echo $@ | grep "\-\-debug" | wc -l)
+debug_echo(){ if [[ "$debug" == "1" ]];then message="$(date +%s) $1"; echo "$message" 1>&2; logger "$message" >/dev/null 2>&1;fi }
+
+my_uci_get(){
+        if [ "$(uci get "$1" 2>&1 | grep "Entry not found" | wc -l)" == "1" ];then
+                debug_echo "$1 not found"  1>&2
+        else
+                echo -n "$(uci get "$1")"
+        fi
+}
+
+DAYS_TRAFFIC_PATH="/usr/sbin/anywifi/days_traffic"
+[ ! -d "$DAYS_TRAFFIC_PATH" ] && mkdir -p "$DAYS_TRAFFIC_PATH"
+[ ! -d "/tmp/anyos" ] && mkdir -p "/tmp/anyos"
+DAYS_TRAFFIC_PATH="/usr/sbin/anywifi/days_traffic"
+search_day(){
+	OEN_DAY_SEC="86400"
+	now_date="$(date "+%Y-%m-%d")"
+	today_begin_sec="$(date -d "$now_date 00:00:00" +%s)"
+	local offset="$1"
+	local day_range="$2"
+	local search_begin_sec="$((today_begin_sec - OEN_DAY_SEC * offset))"
+	local search_end_sec="$((search_begin_sec + OEN_DAY_SEC * day_range))"
+
+	echo "$search_begin_sec $search_end_sec"
+}
+
+all_day_line="$(search_day 6 7)"
+all_day_head="$(echo "$all_day_line" | awk '{print $1}')"
+all_day_end="$(echo "$all_day_line" | awk '{print $2}')"
+
+debug_echo "all_day_head=$all_day_head"
+debug_echo "all_day_end=$all_day_end"
+debug_echo "all_day_head = $(date -d @${all_day_head} "+%Y-%m-%d")"
+debug_echo "all_day_end = $(date -d @${all_day_end} "+%Y-%m-%d")"
+
+search_day_line="$(search_day 0 1)"
+search_day_head="$(echo "$search_day_line" | awk '{print $1}')"
+search_day_end="$(echo "$search_day_line" | awk '{print $2}')"
+search_day_time="$(date -d @${search_day_head} "+%Y-%m-%d")"
+
+log_date_head="$(date +%s)"
+log_date="${log_date_head} $(date "+%Y-%m-%d %H:%M:%S")"
+
+traffic_now="$(cat /proc/net/dev)"
+wan_ifname="$(my_uci_get network.wan.ifname)"
+lan_ifname="br-lan"
+#获取模块流量数据列表数据
+if [ -e "/tmp/anyos/days_traffic_list" ];then
+	days_traffic_list="$(cat /tmp/anyos/days_traffic_list)"
+else
+	days_traffic_list=""
+fi
+#清零列表
+echo "" > /tmp/anyos/days_traffic_list
+
+# 获取模块列表
+module_section_list="$(uci show network | sed -n 's/network.\(4gwan[0-9]*\)\+=interface/\1/p')"
+for module_section in $module_section_list
+do
+	# 根据 module_section 找出模块的两种 ifname
+	module_ifname_tmp="$(my_uci_get network.${module_section}.ifname)"
+	[ -z "$module_ifname_tmp" ] && module_ifname_tmp="NONE"
+	module_ifname_tmp_add="3g-${module_section}"
+
+	#ifname 接口取当前流量
+	flow_module_up_now="$(echo "$traffic_now" | grep -w "${module_ifname_tmp}" | awk '{print $10}')"
+	flow_module_down_now="$(echo "$traffic_now" | grep -w "${module_ifname_tmp}" | awk '{print $2}')"
+	#3g-xxx取当前流量
+	flow_3g_up_now="$(echo "$traffic_now" | grep -w "${module_ifname_tmp_add}" | awk '{print $10}')"
+	flow_3g_down_now="$(echo "$traffic_now" | grep -w "${module_ifname_tmp_add}" | awk '{print $2}')"
+	#记录当前运行流量并覆盖
+	echo "${module_ifname_tmp}_up_old = $flow_module_up_now" >> /tmp/anyos/days_traffic_list
+	echo "${module_ifname_tmp}_down_old = $flow_module_down_now" >> /tmp/anyos/days_traffic_list
+	echo "${module_ifname_tmp_add}_up_old = $flow_3g_up_now" >> /tmp/anyos/days_traffic_list
+	echo "${module_ifname_tmp_add}_down_old = $flow_3g_down_now" >> /tmp/anyos/days_traffic_list
+	#取上一次记录
+	flow_module_up_old="$(echo "$days_traffic_list" | grep -w "${module_ifname_tmp}_up_old" | awk '{print $3}')"
+	flow_module_down_old="$(echo "$days_traffic_list" | grep -w "${module_ifname_tmp}_down_old" | awk '{print $3}')"
+	flow_3g_up_old="$(echo "$days_traffic_list" | grep -w "${module_ifname_tmp_add}_up_old" | awk '{print $3}')"
+	flow_3g_down_old="$(echo "$days_traffic_list" | grep -w "${module_ifname_tmp_add}_down_old" | awk '{print $3}')"
+	#和上一次记录求差值
+	flow_module_up_diff="$((flow_module_up_now - flow_module_up_old))"
+	flow_module_down_diff="$((flow_module_down_now - flow_module_down_old))"
+	flow_3g_up_diff="$((flow_3g_up_now - flow_3g_up_old))"
+	flow_3g_down_diff="$((flow_3g_down_now - flow_3g_down_old))"
+	#如果now-old数据为负，网卡重启，认为流量是累积值，3g-xxx部分与ifname部分分离单独计算
+	if [ "$flow_module_up_diff" -lt 0 -o "$flow_module_down_diff" -lt 0 ];then
+		flow_module_up_diff="$flow_module_up_now"
+		flow_module_down_diff="$flow_module_down_now"
+	fi
+	if [ "$flow_3g_up_diff" -lt 0 -o "$flow_3g_down_diff" -lt 0 ];then
+		flow_3g_up_diff="$flow_3g_up_now"
+		flow_3g_down_diff="$flow_3g_down_now"
+	fi
+	flow_4g_up="$((flow_module_up_diff + flow_3g_up_diff))"
+	flow_4g_down="$((flow_module_down_diff + flow_3g_down_diff))"
+	if [[ -z "$flow_4g_up" ]] || [[ "$flow_4g_up" -lt 0 ]];then
+		flow_4g_up=0
+	fi
+	if [[ -z "$flow_4g_down" ]] || [[ "$flow_4g_down" -le 0 ]];then
+		flow_4g_down=0
+	fi
+
+	if [ -e "$DAYS_TRAFFIC_PATH/${module_section}" ];then
+		search_day_module_up="$(cat "$DAYS_TRAFFIC_PATH/${module_section}" | awk -v tmp=0 'END{print tmp} {if($1>="'"$search_day_head"'" && $1<"'"$search_day_end"'"){tmp+=$5}}')"
+		search_day_module_down="$(cat "$DAYS_TRAFFIC_PATH/${module_section}" | awk -v tmp=0 'END{print tmp} {if($1>="'"$search_day_head"'" && $1<"'"$search_day_end"'"){tmp+=$7}}')"
+	else
+		search_day_module_up=0
+		search_day_module_down=0
+	fi
+	flow_4g_up="$((flow_4g_up + search_day_module_up))"
+	flow_4g_down="$((flow_4g_down + search_day_module_down))"
+	if [ -e "$DAYS_TRAFFIC_PATH/${module_section}" ];then
+		module_data_tmp="$(cat "$DAYS_TRAFFIC_PATH/${module_section}" | awk '{if($1>="'"$all_day_head"'" && $1<"'"$all_day_end"'"){print $0}}' | grep -v "$search_day_time")"
+		echo "$module_data_tmp" > "$DAYS_TRAFFIC_PATH/${module_section}"
+	fi
+	echo "$log_date tx $flow_4g_up rx $flow_4g_down ${module_section}" >> "$DAYS_TRAFFIC_PATH/${module_section}"
+done
+
+# 取lan wan当前流量
+flow_wan_up_now="$(echo "$traffic_now" | grep -w "$wan_ifname" | awk '{print $10}')"
+flow_wan_down_now="$(echo "$traffic_now" | grep -w "$wan_ifname" | awk '{print $2}')"
+flow_lan_up_now="$(echo "$traffic_now" | grep -w "$lan_ifname" | awk '{print $10}')"
+flow_lan_down_now="$(echo "$traffic_now" | grep -w "$lan_ifname" | awk '{print $2}')"
+
+#记录lan wan当前运行流量并覆盖
+echo "${wan_ifname}_up_old = $flow_wan_up_now" >> /tmp/anyos/days_traffic_list
+echo "${wan_ifname}_down_old = $flow_wan_down_now" >> /tmp/anyos/days_traffic_list
+echo "${lan_ifname}_up_old = $flow_lan_up_now" >> /tmp/anyos/days_traffic_list
+echo "${lan_ifname}_down_old = $flow_lan_down_now" >> /tmp/anyos/days_traffic_list
+
+#取lan wan上一次记录
+flow_wan_up_old="$(echo "$days_traffic_list" | grep -w "${wan_ifname}_up_old" | awk '{print $3}')"
+flow_wan_down_old="$(echo "$days_traffic_list" | grep -w "${wan_ifname}_down_old" | awk '{print $3}')"
+flow_lan_up_old="$(echo "$days_traffic_list" | grep -w "${lan_ifname}_up_old" | awk '{print $3}')"
+flow_lan_down_old="$(echo "$days_traffic_list" | grep -w "${lan_ifname}_down_old" | awk '{print $3}')"
+#和上一次lan wan记录求差值
+flow_wan_up="$((flow_wan_up_now - flow_wan_up_old))"
+flow_wan_down="$((flow_wan_down_now - flow_wan_down_old))"
+flow_lan_up="$((flow_lan_up_now - flow_lan_up_old))"
+flow_lan_down="$((flow_lan_down_now - flow_lan_down_old))"
+
+#如果lan wan的 now-old数据为负，网卡重启，认为流量是累积值
+if [ "$flow_wan_up" -lt 0 -o "$flow_wan_down" -lt 0 ];then
+	flow_wan_up="$flow_wan_up_now"
+	flow_wan_down="$flow_wan_down_now"
+fi
+if [ "$flow_lan_up" -lt 0 -o "$flow_lan_down" -lt 0 ];then
+	flow_lan_up="$flow_lan_up_now"
+	flow_lan_down="$flow_lan_down_now"
+fi
+
+#排除错误数据
+if [[ -z "$flow_wan_up" ]] || [[ "$flow_wan_up" -le 0 ]];then
+	flow_wan_up=0
+fi
+if [[ -z "$flow_wan_down" ]] || [[ "$flow_wan_down" -le 0 ]];then
+	flow_wan_down=0
+fi
+
+if [[ -z "$flow_lan_up" ]] || [[ "$flow_lan_up" -le 0 ]];then
+	flow_lan_up=0
+fi
+if [[ -z "$flow_lan_down" ]] || [[ "$flow_lan_down" -le 0 ]];then
+	flow_lan_down=0
+fi
+
+if [ -e "$DAYS_TRAFFIC_PATH/wan" ];then
+	search_day_wan_up="$(cat "$DAYS_TRAFFIC_PATH/wan" | awk -v tmp=0 'END{print tmp} {if($1>="'"$search_day_head"'" && $1<"'"$search_day_end"'"){tmp+=$5}}')"
+	search_day_wan_down="$(cat  "$DAYS_TRAFFIC_PATH/wan" | awk -v tmp=0 'END{print tmp} {if($1>="'"$search_day_head"'" && $1<"'"$search_day_end"'"){tmp+=$7}}')"
+else
+	search_day_wan_up=0
+	search_day_wan_down=0
+fi
+
+if [ -e "$DAYS_TRAFFIC_PATH/lan" ];then
+	search_day_lan_up="$(cat "$DAYS_TRAFFIC_PATH/lan" | awk -v tmp=0 'END{print tmp} {if($1>="'"$search_day_head"'" && $1<"'"$search_day_end"'"){tmp+=$5}}')"
+	search_day_lan_down="$(cat "$DAYS_TRAFFIC_PATH/lan" | awk -v tmp=0 'END{print tmp} {if($1>="'"$search_day_head"'" && $1<"'"$search_day_end"'"){tmp+=$7}}')"
+else
+	search_day_lan_up=0
+	search_day_lan_down=0
+fi
+
+flow_wan_up="$((flow_wan_up + search_day_wan_up))"
+flow_wan_down="$((flow_wan_down + search_day_wan_down))"
+flow_lan_up="$((flow_lan_up + search_day_lan_up))"
+flow_lan_down="$((flow_lan_down + search_day_lan_down))"
+
+if [ -e "$DAYS_TRAFFIC_PATH/wan" ];then
+	wan_data_tmp="$(cat "$DAYS_TRAFFIC_PATH/wan" | awk '{if($1>="'"$all_day_head"'" && $1<"'"$all_day_end"'"){print $0}}' | grep -v "$search_day_time")"
+	echo "$wan_data_tmp" > "$DAYS_TRAFFIC_PATH/wan"
+fi
+echo "$log_date tx $flow_wan_up rx $flow_wan_down wan" >> "$DAYS_TRAFFIC_PATH/wan"
+
+if [ -e "$DAYS_TRAFFIC_PATH/lan" ];then
+	lan_data_tmp="$(cat "$DAYS_TRAFFIC_PATH/lan" | awk '{if($1>="'"$all_day_head"'" && $1<"'"$all_day_end"'"){print $0}}' | grep -v "$search_day_time")"
+	echo "$lan_data_tmp" > "$DAYS_TRAFFIC_PATH/lan"
+fi
+echo "$log_date tx $flow_lan_up rx $flow_lan_down lan" >> "$DAYS_TRAFFIC_PATH/lan"
+
+

@@ -1,0 +1,4 @@
+
+config info 'base'
+	option luci2name 'zbt'
+

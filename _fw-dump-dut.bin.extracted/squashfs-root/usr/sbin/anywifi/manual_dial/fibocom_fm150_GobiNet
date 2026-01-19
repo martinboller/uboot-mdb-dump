@@ -1,0 +1,272 @@
+#!/bin/sh
+#2cb7:0109
+
+[[ "$(pidof ${0##*/} | wc -w)" -gt "2" ]] && echo "Already running ..." && return 2
+
+. /usr/sbin/anywifi/dial_common.sh
+
+atdev="/dev/ttyUSB1"
+ifname="$(get_rndsi_cdc_netcard_name)"
+if [ "$ifname" == "none" ];then
+	ifname="usb0"
+fi
+section="4gwan"
+interfacename="4gwan"
+
+#拨号
+dial()
+{
+	apn=`uci get network.$section.apn 2>/dev/null`
+	at-cmd $atdev AT+CGDCONT=1,\"IP\",\"${apn}\"
+	sleep 2
+	at-cmd $atdev AT\$QCRMCALL=1,1
+	sleep 2
+}
+
+#写配置
+config()
+{
+	uci set network.${section}=interface
+	uci set network.${section}.ifname=${ifname}
+	uci set network.${section}.proto=dhcp
+	uci set network.${section}.metric=5
+	uci set network.wan.metric=3
+	uci commit network
+}
+
+restart_4g_module(){
+	local atdev="$1"
+	local section="$2"
+	ifdown "$section"
+	gpio_4g="$(my_uci_get netcard.device.module_gpio)"
+	active="$(my_uci_get netcard.device.active)"
+	if [ "$gpio_4g" == "" ];then
+		debug_echo "use cfun restart_4g_module"
+		at-cmd $atdev at+cfun=15
+	else
+		debug_echo "use gpio restart_4g_module"
+		[ -z "$active" ] && active=1
+		[ "$active" == "1" ] && value=0
+		[ "$active" == "0" ] && value=1
+		echo $value > /sys/class/gpio/gpio${gpio_4g}/value
+		sleep 5
+		echo $active > /sys/class/gpio/gpio${gpio_4g}/value
+		sleep 15
+	fi
+	pid_vid="$(cat /tmp/mobile_module_name.txt | awk '{print $2}')"
+	pid_vid_judge="$(lsusb | grep -o "$pid_vid")"
+	while [ -z "$pid_vid_judge" ];do
+		sleep 5
+		pid_vid_judge="$(lsusb | grep -o "$pid_vid")"
+	done
+	ttyUSB="$(ls /dev/ttyUSB* | wc -l)"
+	while [ "$ttyUSB" == "0" ];do
+		debug_echo "There is no /dev/ttyUSB*"
+		sleep 10
+		ttyUSB="$(ls /dev/ttyUSB* | wc -l)"
+	done
+	ifup "$section"
+}
+
+ppp_mode="$(my_uci_get network.${section}.proto)"
+if [ "$ppp_mode" == "3g" ];then
+	debug_echo "ppp dial mode, close current mode and break"
+	exit
+fi
+
+while [ ! -f /tmp/module_ifname ]
+do
+	/usr/sbin/anywifi/rclocal.d/S99_module_ifname &
+	sleep 2
+done
+ifname="$(cat /tmp/module_ifname)"
+while [ "$ifname" == none ]
+do
+	ifname="$(cat /tmp/module_ifname)"
+	sleep 5
+done
+#判断模块配置
+set_firewall "$section"
+config_judge=0
+[ "$(uci -q get network.4gwan)" == "interface" ] || config_judge=1
+[ "$(uci -q get network.4gwan.ifname)" == "$ifname" ] || config_judge=1
+[ "$(uci -q get network.4gwan.proto)" == "dhcp" ] || config_judge=1
+[ -n "$(uci -q get network.4gwan.metric | grep -w "[0-9]\+")" ] || config_judge=1
+[ -n "$(uci -q get network.wan.metric | grep -w "[0-9]\+")" ] || config_judge=1
+[ "$(uci -q get network.wan.metric)" != "$(uci -q get network.4gwan.metric)" ] || config_judge=1
+if [ "$config_judge" == 1 ];then
+	config
+	debug_echo "reate $section network config"
+	ifup wan
+	ifup "$section"
+fi
+
+ping_sh_pid="$(ps -w | grep "/usr/sbin/anywifi/manual_dial/module_ping.sh" | grep -v "grep" | awk '{print $1}')"
+if [ -z "$ping_sh_pid" ];then
+	/usr/sbin/anywifi/manual_dial/module_ping.sh $ifname &
+fi
+
+first_dial=1
+trap "restart_4g_module $atdev $section" USR1
+while [ 1 ]
+do
+	ttyUSB="$(ls /dev/ttyUSB* | wc -l)"
+	if [ "$ttyUSB" == "0" ];then
+		debug_echo "Ec200t script : There is no /dev/ttyUSB*"
+		sleep 10
+		continue
+	fi
+	ppp_mode="$(my_uci_get network.${section}.proto)"
+	if [ "$ppp_mode" == "3g" ];then
+		debug_echo "ppp dial mode, close current mode and break"
+		break
+	fi
+
+	#读取模块信息
+	vendor=$(at-cmd $atdev AT+CGMI | sed -n '2p' | tr -d '\r')
+	model=$(at-cmd $atdev AT+GMM | sed -n '2p' | tr -d '\r')
+	imei=$(at-cmd $atdev AT+GSN | sed -n '2p' | tr -d '\r')
+	[ "$(echo $imei | wc -L)" -le "10" ] && imei=""
+	debug_echo "imei : $imei"
+
+	imsi=$(at-cmd $atdev AT+CIMI | sed -n '2p' | tr -d '\r')
+	debug_echo "imsi : $imsi"
+
+	iccid=$(at-cmd $atdev AT+CCID | sed -n '2p' | cut -c 8-27)
+	iccid_len=$(echo ${iccid} | wc -L)
+	if [ $iccid_len != "20" ]  && [ $iccid_len != "19" ];then
+		iccid="NO SIM"
+		cpin="None"
+		cops="None"
+		debug_echo "NO_SIM...."
+		cnt=$((cnt+1))
+	else
+		cpin="$(at-cmd $atdev AT+CPIN? | sed -n '2p' | cut -d ':' -f2 | sed 's/ //g' | tr -d '\r')"
+		cops_tmp="$(at-cmd $atdev AT+COPS?)"
+		cops="$(echo "$cops_tmp"  | sed -n '2p' | cut -d '"' -f2 | tr -d '\r')"
+		cops_act="$(echo "$cops_tmp" | sed -n '2p' | awk -F ',' '{print $4}' | sed 's/ //g' | tr -d '\r')"
+		[ "$(echo $cops | grep -wi "cops" | wc -l)" == "1" ] && cops="None"
+		if [ "$cops" == "None" ];then
+			net_type="None"
+			signal=
+		elif [ "${cops_act}" == "11" ] || [ "$cops_act" == "12" ];then
+			net_type="5G SA"
+			rsrp=$(at-cmd $atdev AT+CESQ |sed -n '2p' | sed 's/.*:\(.*$\)/\1/'| cut -d ',' -f 8 | sed 's/ //g' | tr -d '\r')
+			if [ "$rsrp" == 255 ] ;then
+				signal=
+			elif [ "$rsrp" -ge 62 ] && [ "$rsrp" -ne 255 ] ;then
+				csq_temp=80
+				csq_rsrp=$(printf "%d" $((($rsrp-62)*20/64)))
+				signal=$(expr $csq_temp + $csq_rsrp)
+			elif [ "$rsrp" -ge 52 ];then
+				csq_temp=60
+				csq_rsrp=$(printf "%d" $((($rsrp-52)*20/10)))
+				signal=$(expr $csq_temp + $csq_rsrp)
+			elif [ "$rsrp" -ge 42 ];then
+				csq_temp=40
+				csq_rsrp=$(printf "%d" $((($rsrp-42)*20/10)))
+				signal=$(expr $csq_temp + $csq_rsrp)
+			elif [ "$rsrp" -ge 32 ];then
+				csq_temp=20
+				csq_rsrp=$(printf "%d" $((($rsrp-32)*20/10)))
+				signal=$(expr $csq_temp + $csq_rsrp)
+			elif [ "$rsrp" -ge 1 ];then
+				csq_temp=0
+				csq_rsrp=$(printf "%d" $((($rsrp-1)*20/31)))
+				signal=$(expr $csq_temp + $csq_rsrp)
+			else
+				signal=
+			fi
+		elif [ "${cops_act}" == "10" ] || [ "$cops_act" == "13" ];then
+			net_type="5G NSA"
+			rsrp=$(at-cmd $atdev AT+CESQ |sed -n '2p' | sed 's/.*:\(.*$\)/\1/'| cut -d ',' -f 6 | sed 's/ //g' | tr -d '\r')
+			if [ "$rsrp" == 255 ] ;then
+				signal=
+			elif [ "$rsrp" -ge 46 ] && [ "$rsrp" -ne 255 ] ;then
+				csq_temp=80
+				csq_rsrp=$(printf "%d" $((($rsrp-46)*20/51)))
+				signal=$(expr $csq_temp + $csq_rsrp)
+			elif [ "$rsrp" -ge 36 ];then
+				csq_temp=60
+				csq_rsrp=$(printf "%d" $((($rsrp-36)*20/10)))
+				signal=$(expr $csq_temp + $csq_rsrp)
+			elif [ "$rsrp" -ge 26 ];then
+				csq_temp=40
+				csq_rsrp=$(printf "%d" $((($rsrp-26)*20/10)))
+				signal=$(expr $csq_temp + $csq_rsrp)
+			elif [ "$rsrp" -ge 16 ];then
+				csq_temp=20
+				csq_rsrp=$(printf "%d" $((($rsrp-16)*20/10)))
+				signal=$(expr $csq_temp + $csq_rsrp)
+			elif [ "$rsrp" -ge 1 ];then
+				csq_temp=0
+				csq_rsrp=$(printf "%d" $((($rsrp-1)*20/15)))
+				signal=$(expr $csq_temp + $csq_rsrp)
+			else
+				signal=
+			fi
+		else
+			net_type="4G/3G/2G"
+			rsrp=$(at-cmd $atdev AT+CSQ|sed -n '2p'|sed 's/.*:\(.*$\)/\1/'| cut -d ',' -f 1|sed 's/ //g')
+			if [ "$rsrp" == 99 ]; then
+				signal=
+			elif [ "$rsrp" -ge 14 ] && [ "$rsrp" -ne 99 ] ;then
+				csq_temp=80
+				csq_rsrp=$(printf "%d" $((($rsrp-14)*20/17)))
+				signal=$(expr $csq_temp + $csq_rsrp)
+			elif [ "$rsrp" -ge 9 ];then
+				csq_temp=60
+				csq_rsrp=$(printf "%d" $((($rsrp-9)*20/5)))
+				signal=$(expr $csq_temp + $csq_rsrp)
+			elif [ "$rsrp" -ge 4 ];then
+				csq_temp=40
+				csq_rsrp=$(printf "%d" $((($rsrp-4)*20/5)))
+				signal=$(expr $csq_temp + $csq_rsrp)
+			elif [ "$rsrp" -ge 1 ];then
+				csq_temp=20
+				csq_rsrp=$(printf "%d" $((($rsrp-16)*20/3)))
+				signal=$(expr $csq_temp + $csq_rsrp)
+			else
+				signal=
+			fi
+		fi
+		debug_echo "cops_act=$cops_act rsrp=$rsrp csq_rsrp=$csq_rsrp csq_temp=$csq_temp"
+		stat_4g="$(ifconfig $ifname | sed -n '2p' | grep "inet addr" | wc -l)"
+		ret="$(ping_test $ifname)"
+		if [ "$stat_4g" == "0" -o "$ret" == "1" -o "$first_dial" == 1  ];then
+			first_dial=0
+			cnt=$((cnt+1))
+			dial
+			ifup $interfacename
+			debug_echo "fm150 script : exec $section diag and ifup $interfacename"
+		else
+			irq_num="$(my_uci_get netcard.device.irq_num)"
+			[ -n "$irq_num" ] && echo 2 > /proc/irq/${irq_num}/smp_affinity
+			echo 4 > /sys/class/net/${ifname}/queues/rx-0/rps_cpus
+			cnt=0
+		fi
+	fi
+
+	set_firewall $interfacename
+
+	debug_echo "fibocom150 script : update 4ginfo > /tmp/4ginfo"
+
+#输出json
+cat > /tmp/4ginfo <<EOF
+{
+"device_model":"$vendor $model",
+"sim_status":"$cpin"
+"signal":"$signal",
+"iccid":"$iccid",
+"imsi":"$imsi",
+"imei":"$imei",
+"net_type":"$net_type",
+"cops":"$cops"
+}
+EOF
+	[ "$cnt" -ge "4" ] && cnt=0 && restart_4g_module $atdev $section
+
+	sleep 8
+
+done
+

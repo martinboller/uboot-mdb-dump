@@ -1,0 +1,554 @@
+#!/bin/sh
+if [ -e "/var/run/${0##*/}.pid" ] ;then
+        if [ -e "/proc/$(cat /var/run/${0##*/}.pid)" ];then
+                echo "${0##*/} is already running"
+                return 2
+        fi
+fi
+echo "$$" > /var/run/${0##*/}.pid
+
+debug=$(echo $@ | grep "\-\-debug" | wc -l)
+debug_echo(){ if [[ "$debug" == "1" ]];then message="$(date +%s) $1"; echo "$message" 1>&2; logger "$message" >/dev/null 2>&1;fi }
+
+my_uci_get(){
+        if [ "$(uci get "$1" 2>&1 | grep "Entry not found" | wc -l)" == "1" ];then
+                debug_echo "$1 not found"  1>&2
+        else
+                echo -n "$(uci get "$1")"
+        fi
+}
+. /usr/share/libubox/jshn.sh
+NET_LOG_PATH="/tmp/net_log"
+[ -d "$NET_LOG_PATH" ] || mkdir "$NET_LOG_PATH"
+
+LOG_PATH=/www/log_list
+log_write(){
+	log_date="$(date "+%Y-%m-%d %H:%M:%S")"
+	log_content="$1"
+	log_line="$log_date $log_content"
+	[ -e "$LOG_PATH" ] || echo "$log_date sys:\"Start logging\"" > "$LOG_PATH"
+	log_num="$(wc -l "$LOG_PATH" | awk '{print $1}')"
+	if [ "$log_num" -gt 100 ];then
+		debug_echo "$LOG_PATH is too big  = $log_num"
+		sed -i "1i $log_line" "$LOG_PATH"
+		sed -i '101,$d' "$LOG_PATH"
+	else
+		debug_echo "$LOG_PATH is righet = $log_num"
+		sed -i "1i $log_line" "$LOG_PATH"
+	fi
+	debug_echo "$log_line"
+	return 0
+}
+
+ping_test(){
+	ping_interface="$1"
+	detect_host1="$(my_uci_get anyos_netwatchdog.device.detect_host1)"
+	detect_host2="$(my_uci_get anyos_netwatchdog.device.detect_host2)"
+	local ping_count="$(my_uci_get anyos_netwatchdog.device.ping_count)"
+	[ "$ping_count" -ge 30 ] || ping_count=30
+	local i
+	if [ "$ping_interface" == "apcli0" ];then
+		for i in `seq 1 $ping_count`
+		do
+			detect_host3="$(route -n | awk '{if($4=="UG"&&$8=="apcli0"){print $2}}')"
+			if [ -n "$detect_host3" ];then
+				ping -c 1 -W 1 -w 1 -s 0 -I "$ping_interface" "$detect_host3" >/dev/null
+				ret3=$?
+			else
+				ret3=1
+			fi
+			if [ "$ret3" == "0" ];then
+				debug_echo "$ping_interface ping success"
+				ret_end=1
+				break
+			else
+				debug_echo "$ping_interface ping fail"
+				ret_end=0
+			fi
+		done
+	else
+	
+		for i in `seq 1 $ping_count`
+		do
+			if [ "$detect_host1" == "" ];then
+				ret1=1
+			else
+				ping -c 1 -W 1 -w 1 -s 0 -I "$ping_interface" "$detect_host1" >/dev/null
+				ret1=$?
+			fi
+			
+			if [ "$detect_host2" == "" ];then
+				ret2=1
+			else
+				ping -c 1 -W 1 -w 1 -s 0 -I "$ping_interface" "$detect_host2" >/dev/null
+				ret2=$?
+			fi
+			if [ "$ret1" == "0" -o "$ret2" == "0" ];then
+				debug_echo "$ping_interface ping success"
+				ret_end=1
+				break
+			else
+				debug_echo "$ping_interface ping fail"
+				ret_end=0
+			fi
+		done
+	fi
+	echo "$ret_end"
+}
+
+module_search_interface(){
+	local module_section_tmp="$1"
+	#获取模块 interface
+	module_proto="$(my_uci_get network.${module_section_tmp}.proto)"
+	if [ "$module_proto" == "3g" ];then
+		module_interface_tmp="3g-${module_section_tmp}"
+	else
+		module_ifname="$(my_uci_get network.${module_section_tmp}.ifname)"
+		module_interface_tmp="$module_ifname"
+	fi
+	debug_echo "module_proto = $module_proto module_interface_tmp=$module_interface_tmp"
+	[ -z "$module_interface_tmp" ] && module_interface_tmp="NONE"
+	echo "$module_interface_tmp"
+}
+
+module_ping_state(){
+	local module_interface_ping="$1"
+	#检测4G模块 ping状态
+	local module_ping_old="$(echo "$netstat_old" | grep -w "${module_interface_ping}_old" | awk '{print $3}')"
+	local module_ping_now="$(cat $NET_LOG_PATH/netstat | grep -w "${module_interface_ping}_old" | awk '{print $3}')"
+	local module_judge="$((module_ping_now ^ module_ping_old))"
+	debug_echo "module_section=$module_section state is $module_judge module_ping_now=$module_ping_now"
+	echo "$module_judge"
+}
+
+default_route_print(){
+	local default_iface_change=0
+	local default_iface="$1"
+	internet_led_name="$(my_uci_get anyos.led.internet_led_name)"
+	if [ "$default_iface" == "none" ];then
+		if [ -n "$internet_led_name" ];then
+			echo "none" > /sys/class/leds/${internet_led_name}/trigger
+		fi
+	else
+		if [ -n "$internet_led_name" ];then
+			echo "default-on" > /sys/class/leds/${internet_led_name}/trigger
+		fi
+	fi
+	#打印默认通网的路由接口
+	if [ -f /tmp/netstat.txt ];then
+		default_iface_old="$(cat /tmp/netstat.txt)"
+		[ "$default_iface" != "$default_iface_old" ] && default_iface_change=1
+	else
+		default_iface_change=1
+	fi
+	debug_echo "default_iface_old=$default_iface_old default_iface=$default_iface default_iface_change=$default_iface_change"
+	if [ "$default_iface_change" == 1 ];then
+		if [ "$default_iface" == "none" ];then
+			log_content="net:\"Can't connect network\""
+		else
+			log_content="net:\"default_iface have change and use iface is $default_iface\""
+		fi
+		log_write "$log_content"
+		echo "$default_iface" > /tmp/netstat.txt
+	fi
+}
+
+ping_background(){
+	local net="$1"
+	local default_lock="$2"
+
+	ping_status="$(ping_test "$net")"
+	if [ "$default_lock" == 0 ];then
+		if [ "$ping_status" == 1 ];then
+			default_iface="$net"
+		else
+			default_iface="none"
+		fi
+		default_route_print "$default_iface"
+	fi
+	echo "${net}_old = ${ping_status}" >> $NET_LOG_PATH/netstat
+	net_old="$(echo "$netstat_old" | grep -w "${net}_old" | awk '{print $3}')"
+	debug_echo "net_old $net_old"
+	net_judge="$((ping_status ^ net_old))"
+	debug_echo "net_judge = $net_judge ${net}_old=${ping_status}"
+	if [ "$net_judge" == 1 ];then
+		if [ "$ping_status" == 1 ];then
+			echo "$net" >> $NET_LOG_PATH/change_ping_success
+		else
+			echo "$net" >> $NET_LOG_PATH/change_ping_fail
+		fi
+	fi
+}
+
+module_led_name="$(my_uci_get anyos.led.module_led_name)"
+for module_led_name_tmp in $module_led_name
+do
+	debug_echo " ------------------- module_led init ------------------ "
+	debug_echo "module_led_name_tmp = $module_led_name_tmp"
+	echo -n "none" > /sys/class/leds/${module_led_name_tmp}/trigger
+	debug_echo " ----------------- module_led init end ---------------- "
+done
+
+while true
+do
+	detect_host1="$(my_uci_get anyos_netwatchdog.device.detect_host1)"
+	detect_host2="$(my_uci_get anyos_netwatchdog.device.detect_host2)"
+	route_data="$(route -n | grep -w "UG")"
+
+	net_list="$(echo "$route_data" | awk '{print $8}')"
+	debug_echo "---------host1 $detect_host1-----------"
+	debug_echo "---------host2 $detect_host2-----------"
+	debug_echo "net_list $net_list"
+
+	if [ -e $NET_LOG_PATH/netstat ];then
+		netstat_old="$(cat $NET_LOG_PATH/netstat)"
+		cp $NET_LOG_PATH/netstat $NET_LOG_PATH/netstat~
+	fi
+	#状态信息显示
+	debug_echo "------------------"
+	debug_echo "$(cat $NET_LOG_PATH/netstat)"
+	debug_echo "------------------"
+
+	#参数清零
+	echo -n '' > $NET_LOG_PATH/netstat
+	default_iface="none"
+	echo -n '' > $NET_LOG_PATH/change_ping_success
+	echo -n '' > $NET_LOG_PATH/change_ping_fail
+	reduce_list=""
+	add_list=""
+	default_iface_change=0
+
+	#检查iface增减
+	if [ -n "$net_list" ];then
+		echo "$net_list" > $NET_LOG_PATH/net_list
+	else
+		echo -n '' > $NET_LOG_PATH/net_list
+	fi
+	if [ -f $NET_LOG_PATH/net_list_old ];then
+		reduce_list="$(grep -vwf $NET_LOG_PATH/net_list $NET_LOG_PATH/net_list_old)"
+		# add_list="$(grep -vwf $NET_LOG_PATH/net_list_old $NET_LOG_PATH/net_list | tr '\n' ' ' | sed 's/[ \t]*$//g')"
+		add_list="$(grep -vwf $NET_LOG_PATH/net_list_old $NET_LOG_PATH/net_list)"
+	else
+		# add_list="$(echo "$net_list" | tr '\n' ' ' | sed 's/[ \t]*$//g')"
+		add_list="$(echo "$net_list")"
+	fi
+	net_list_old="$net_list"
+	if [ -n "$net_list_old" ];then
+		echo "$net_list_old" > $NET_LOG_PATH/net_list_old
+	else
+		echo -n '' > $NET_LOG_PATH/net_list_old
+	fi
+	debug_echo "reduce_list=$reduce_list"
+	debug_echo "add_list=$add_list"
+	module_section_list="$(uci show network | sed -n 's/network.\(4gwan[0-9]*\)\+=interface/\1/p' | sort)"
+	for module_section in $module_section_list
+	do
+		module_interface="$(module_search_interface $module_section)"
+		add_list="$(echo "$add_list" | grep -v "$module_interface")"
+		reduce_list="$(echo "$reduce_list" | grep -v "$module_interface")"
+	done
+	add_list="$(echo "$add_list" | tr '\n' ' ' | sed 's/[ \t]*$//g')"
+	if [ -n "$reduce_list" ];then
+		for del_iface in "$reduce_list"
+		do
+			echo "$del_iface" >> $NET_LOG_PATH/change_ping_fail
+		done
+		reduce_list="$(echo "$reduce_list" | tr '\n' ' ' | sed 's/[ \t]*$//g')"
+	fi
+	debug_echo "rm module interface reduce_list=$reduce_list"
+	debug_echo "rm module interface add_list=$add_list"
+
+	for net in $net_list
+	do
+		route_top="$(echo "$route_data" | sed -n '1p' |awk '{print $8}')"
+		if [ "$route_top" == "$net" ];then
+			default_lock=0
+		else
+			default_lock=1
+		fi
+		(ping_background "$net" "$default_lock") &
+	done
+
+	wait
+	change_ping_success="$(cat $NET_LOG_PATH/change_ping_success | tr '\n' ' ' | sed 's/[ \t]*$//g')"
+	change_ping_fail="$(cat $NET_LOG_PATH/change_ping_fail | tr '\n' ' ' | sed 's/[ \t]*$//g')"
+
+	module_led_name="$(my_uci_get anyos.led.module_led_name)"
+	#控制4G模块led
+	if [ -n "$module_led_name" ];then
+		debug_echo " --------------------- module_led --------------------- "
+		#获取模块列表
+		ping_fail_module_led_list=""
+		ping_fail_module_led=""
+		module_section_list="$(uci show network | sed -n 's/network.\(4gwan[0-9]*\)\+=interface/\1/p')"
+		for module_section in $module_section_list
+		do
+			module_interface="$(module_search_interface "$module_section")"
+			module_judge="$(module_ping_state "$module_interface")"
+			module_judge_cnt="$((module_judge_cnt + module_judge))"
+			debug_echo "module_interface=$module_interface module_judge=$module_judge module_judge_cnt=$module_judge_cnt"
+			if [ -f /etc/config/netcard_db ];then
+				internet_interface_judge="$(echo "$module_interface" | sed -n 's/3g-4gwan\([0-9]\+\).*/\1/p')"
+				if [ -z "$internet_interface_judge" ];then
+					module_db_name="$module_interface"
+				else
+					module_db_name="4ginfo${internet_interface_judge}"
+				fi
+				debug_echo "module_led :module_db_name=$module_db_name"
+				module_bus="$(uci -c /tmp show netcard_db | sed -n 's/netcard_db.'$module_db_name'.bus=\(.*\)/\1/p' | tr -d "[']")"
+				debug_echo "module_led :module_bus=$module_bus"
+				[ -z "$module_bus" ] && debug_echo "-z module_bus, so continue" && continue
+				module_bus_section="$(uci show netcard_db | sed -n 's/netcard_db.\(bus[0-9]*\).bus='\'$module_bus\''/\1/p')"
+				debug_echo "module_led :module_bus_section=$module_bus_section"
+				[ -z "$module_bus_section" ] && debug_echo "-z module_bus_section, so continue" && continue
+				module_led_name_end="$(my_uci_get netcard_db.${module_bus_section}.module_led_name)"
+				debug_echo "module_led : module_led_name_end=$module_led_name_end"
+				[ -z "$module_led_name_end" ] && debug_echo "-z module_led_name_end, so continue" && continue
+			else
+				module_led_name_end="$(my_uci_get anyos.led.module_led_name)"
+				debug_echo "module_led_name_end=$module_led_name_end"
+			fi
+
+			#检测当前模块ping状态
+			module_ping_now="$(cat $NET_LOG_PATH/netstat | grep -w "${module_interface}_old" | awk '{print $3}')"
+			debug_echo "module_ping_now=$module_ping_now"
+			if [ "$module_ping_now" != 1 ];then
+				#ping 不成功灭灯
+				ping_fail_module_led_list="$(echo "${module_led_name_end} ${ping_fail_module_led_list}" | sed 's/[ \t]*$//g')"
+			fi
+			#ping 成功检查system配置是否正确 不正确设置配置
+			sys_led="$(uci show system | awk -F "." '/sysfs='\'$module_led_name_end\''/{print $2}')"
+			[ -z "$sys_led" ] && sys_led="$(uci add system led)"
+			sys_dev="$(my_uci_get system.${sys_led}.dev)"
+			if [ "$module_interface" != "$sys_dev" ];then
+				uci set system.${sys_led}.name="$module_led_name_end"
+				uci set system.${sys_led}.sysfs="$module_led_name_end"
+				uci set system.${sys_led}.trigger="netdev"
+				uci set system.${sys_led}.dev="$module_interface"
+				uci set system.${sys_led}.mode="link tx rx"
+				uci commit system
+				module_judge=1
+			fi
+			module_judge_cnt="$((module_judge_cnt + module_judge))"
+		done
+		debug_echo "module_judge_cnt=$module_judge_cnt"
+		debug_echo "ping_fail_module_led_list=$ping_fail_module_led_list"
+		if [ "$module_judge_cnt" != 0 ];then
+			/etc/init.d/led restart
+			module_judge_cnt=0
+		fi
+		for ping_fail_module_led in $ping_fail_module_led_list
+		do
+			debug_echo "ping_fail_module_led = $ping_fail_module_led"
+			echo -n "0" > /sys/class/leds/${ping_fail_module_led}/brightness
+		done
+		debug_echo " --------------------- module_led_name end --------------------- "
+	fi
+	
+	module_sim_led_name="$(my_uci_get anyos.led.module_sim_led_name)"
+	#控制4G模块sim灯
+	if [ -n "$module_sim_led_name" ];then
+		debug_echo " --------------------- module_sim_led --------------------- "
+		#获取模块列表
+		module_section_list="$(uci show network | sed -n 's/network.\(4gwan[0-9]*\)\+=interface/\1/p')"
+		for module_section in $module_section_list
+		do
+			module_interface="$(module_search_interface "$module_section")"
+			info_number="${module_section:5}"
+			if [ -f "/tmp/4ginfo${info_number}" ];then
+				model_date="$(cat /tmp/4ginfo${info_number})"
+			else
+				model_date=""
+			fi
+			debug_echo "module_interface=$module_interface info_number=$info_number"
+			iccid_judge="$(echo "$model_date" | grep -o READY)"
+			debug_echo "module_interface=$module_interface iccid_judge=$iccid_judge"
+				if [ -f /etc/config/netcard_db ];then
+					internet_interface_judge="$(echo "$module_interface" | sed -n 's/3g-4gwan\([0-9]\+\).*/\1/p')"
+					if [ -z "$internet_interface_judge" ];then
+						module_db_name="$module_interface"
+					else
+						module_db_name="4ginfo${internet_interface_judge}"
+					fi
+					debug_echo "module_sim_led :module_db_name=$module_db_name"
+					module_bus="$(uci -c /tmp show netcard_db | sed -n 's/netcard_db.'$module_db_name'.bus=\(.*\)/\1/p' | tr -d "[']")"
+					debug_echo "module_sim_led :module_bus=$module_bus"
+					[ -z "$module_bus" ] && debug_echo "-z module_bus, so continue" && continue 
+					module_bus_section="$(uci show netcard_db | sed -n 's/netcard_db.\(bus[0-9]*\).bus='\'$module_bus\''/\1/p')"
+					debug_echo "module_sim_led :module_bus_section=$module_bus_section"
+					[ -z "$module_bus_section" ] && debug_echo "-z module_bus_section, so continue" && continue 
+					module_sim_led_name="$(my_uci_get netcard_db.${module_bus_section}.module_sim_led_name)"
+					debug_echo "module_sim_led :module_sim_led_name=$module_sim_led_name"
+					[ -z "$module_sim_led_name" ] && debug_echo "-z module_sim_led_name, so continue" && continue
+					sim_switch_gpio="$(my_uci_get netcard_db.${module_bus_section}.sim_switch_gpio)"
+					if [ -e /sys/class/gpio/gpio${sim_switch_gpio}/value ];then
+						sim_switch_value="$(cat /sys/class/gpio/gpio${sim_switch_gpio}/value)"
+						sim_led_position="$((sim_switch_value + 1))"
+						for poll_sim_led in $module_sim_led_name
+						do
+							echo -n "none" > /sys/class/leds/${poll_sim_led}/trigger
+						done
+						json_load "$model_date"
+						json_get_var name name
+						if [ "$sim_switch_value" = 0 ];then
+							SIMX="$(my_uci_get netcard_db.${module_bus_section}.value0_sim)"
+						elif [ "$sim_switch_value" = 1 ];then
+							SIMX="$(my_uci_get netcard_db.${module_bus_section}.value1_sim)"
+						fi
+						if [ "$name" != "$SIMX" ];then
+							iccid_judge="NO_READY"
+						fi
+						debug_echo "module_sim_led :sim_switch_gpio=$sim_switch_gpio sim_switch_value=$sim_switch_value name=$name SIMX=$SIMX iccid_judge=$iccid_judge"
+						module_sim_led_name="$(my_uci_get netcard_db.${module_bus_section}.module_sim_led_name | awk '{print $"'"$sim_led_position"'"}')"
+					fi
+					if [ "$iccid_judge" == "READY" ];then
+						echo -n "default-on" > /sys/class/leds/${module_sim_led_name}/trigger
+					else
+						echo -n "none" > /sys/class/leds/${module_sim_led_name}/trigger
+					fi
+				else
+					module_sim_led_name="$(my_uci_get anyos.led.module_sim_led_name)"
+					module_sim_led_num="$(echo "$module_sim_led_name" | wc -w)"
+					sim_switch_gpio="$(uci -q get netcard.device.sim_switch_gpio)"
+					if [ "$module_sim_led_num" == 2 ] && [ -n "$sim_switch_gpio" ];then
+						gpio_default_value="$(uci -q get netcard.device.gpio_default_value)"
+						if [ "$gpio_default_value" == 1 ];then
+							module_sim_led_name="$(echo "$module_sim_led_name" | awk '{print $2}')"
+						else
+							module_sim_led_name="$(echo "$module_sim_led_name" | awk '{print $1}')"
+						fi
+					fi
+					debug_echo "module_sim_led_name=$module_sim_led_name"
+					if [ "$iccid_judge" == "READY" ];then
+						echo -n "default-on" > /sys/class/leds/${module_sim_led_name}/trigger
+					else
+						echo -n "none" > /sys/class/leds/${module_sim_led_name}/trigger
+					fi
+				fi
+		done
+		debug_echo " --------------------- module_sim_led end --------------------- "
+	fi
+
+	#控制4G模块rssi灯
+	module_rssi_name="$(my_uci_get anyos.led.module_rssi_name)"
+	if [ -n "$module_rssi_name" ];then
+		debug_echo " --------------------- module_rssi --------------------- "
+		module_section_list="$(uci show network | sed -n 's/network.\(4gwan[0-9]*\)\+=interface/\1/p')"
+		for module_section in $module_section_list
+		do
+			module_interface="$(module_search_interface "$module_section")"
+			info_number="${module_section:5}"
+			if [ -f "/tmp/4ginfo${info_number}" ];then
+				model_date="$(cat /tmp/4ginfo${info_number})"
+			else
+				model_date=""
+			fi
+			debug_echo "module_interface=$module_interface info_number=$info_number"
+			module_ping_now="$(cat $NET_LOG_PATH/netstat | grep -w "${module_interface}_old" | awk '{print $3}')"
+			debug_echo "module_ping_now=$module_ping_now"
+			if [ -f /etc/config/netcard_db ];then
+				internet_interface_judge="$(echo "$module_interface" | sed -n 's/3g-4gwan\([0-9]\+\).*/\1/p')"
+				if [ -z "$internet_interface_judge" ];then
+					module_db_name="$module_interface"
+				else
+					module_db_name="4ginfo${internet_interface_judge}"
+				fi
+				debug_echo "module_rssi :module_db_name=$module_db_name"
+				module_bus="$(uci -c /tmp show netcard_db | sed -n 's/netcard_db.'$module_db_name'.bus=\(.*\)/\1/p' | tr -d "[']")"
+				debug_echo "module_rssi :module_bus=$module_bus"
+				[ -z "$module_bus" ] && debug_echo "-z module_bus, so continue" && continue
+				module_bus_section="$(uci show netcard_db | sed -n 's/netcard_db.\(bus[0-9]*\).bus='\'$module_bus\''/\1/p')"
+				debug_echo "module_rssi :module_bus_section=$module_bus_section"
+				[ -z "$module_bus_section" ] && debug_echo "-z module_bus_section, so continue" && continue
+				module_rssi_name="$(my_uci_get netcard_db.${module_bus_section}.module_rssi_name)"
+				signal_partition="$(my_uci_get netcard_db.${module_bus_section}.signal_partition)"
+				debug_echo "module_rssi : module_rssi_name=$module_rssi_name signal_partition=$signal_partition"
+				[ -z "$module_rssi_name" ] && debug_echo "-z module_rssi_name, so continue" && continue
+			else
+				module_rssi_name="$(my_uci_get anyos.led.module_rssi_name)"
+				signal_partition="$(my_uci_get anyos.led.signal_partition)"
+				debug_echo "module_rssi_name=$module_rssi_name"
+			fi
+
+			if [ "$module_ping_now" == 1 ];then
+			#只有连上网才显示信号灯
+				rssi_num="$(echo "$module_rssi_name" | wc -w)"
+				signal_partition_num="$(echo "$signal_partition" | wc -w)"
+				rssi_difference="$((100 / rssi_num))"
+				signal=0
+				if [ -f /etc/config/netcard_db ];then
+					if [ -n "$model_date" ];then
+						json_load "$model_date"
+						json_get_var signal signal
+					fi
+				else
+					signal="$(cat /tmp/4ginfo | grep signal | awk -F '"' '{print $4}')"
+				fi
+				for i in `seq 1 $rssi_num`
+				do
+					rssi_tmp="$(echo "$module_rssi_name" | awk '{print $"'"$i"'"}')"
+					if [ -z "$signal_partition" ];then
+						signal_judge="$((signal - rssi_difference * i + rssi_difference))"
+					elif [ -n "$signal_partition" ];then
+						signal_partition_tmp="$(echo "$signal_partition" | awk '{print $"'"$i"'"}')"
+						signal_judge="$((signal - signal_partition_tmp))"
+					fi
+					debug_echo "rssi_tmp=$rssi_tmp signal_judge=$signal_judge"
+					if [ "$signal_judge" -gt 0 ];then
+						debug_echo "light on $rssi_tmp"
+						echo -n  "default-on" > /sys/class/leds/${rssi_tmp}/trigger
+					else
+						debug_echo "put out $rssi_tmp"
+						echo -n "none" > /sys/class/leds/${rssi_tmp}/trigger
+					fi
+				done
+			else
+			#连不上网关闭所有信号灯
+				if [ -n "$module_rssi_name" ];then
+					rssi_num="$(echo "$module_rssi_name" | wc -w)"
+					rssi_difference="$((100 / rssi_num))"
+					for i in `seq 1 $rssi_num`
+					do
+						rssi_tmp="$(echo "$module_rssi_name" | awk '{print $"'"$i"'"}')"
+						debug_echo "put out $rssi_tmp"
+						echo -n "none" > /sys/class/leds/${rssi_tmp}/trigger
+					done
+				fi
+			fi
+		done
+		debug_echo " --------------------- module_rssi end --------------------- "
+	fi
+
+	#打印增加的接口
+	if [ ! -z "$add_list" ];then
+		log_content="net:\"route table iface added $add_list\""
+		log_write "$log_content"
+	fi
+	#打印缩减的接口
+	if [ ! -z "$reduce_list" ];then
+		log_content="net:\"route table iface reduced $reduce_list\""
+		log_write "$log_content"
+	fi
+	#打印网络状态变为通的接口
+	debug_echo "change_ping_success=$change_ping_success"
+	for iface_success in $change_ping_success
+	do
+		iface_gateway="$(echo "$route_data" | grep -w "$iface_success" | awk '{print $2}')"
+		log_content="net:\"iface $iface_success change to ping success and default route to $iface_gateway\""
+		log_write "$log_content"
+	done
+	#打印网络状态变为不通的接口
+	debug_echo "change_ping_fail=$change_ping_fail"
+	for iface_fail in $change_ping_fail
+	do
+		log_content="net:\"iface $iface_fail change to ping fail\""
+		log_write "$log_content"
+	done
+	#net_list 为空打印默认路由状态
+	if [ -z "$net_list" ];then
+		default_iface="none"
+		default_route_print "$default_iface"
+	fi
+	debug_echo "sleep"
+	sleep 1
+done

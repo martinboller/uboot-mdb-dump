@@ -1,0 +1,6352 @@
+#!/bin/sh
+
+debug=$(echo $@ | grep "\-\-debug" | wc -l)
+debug_echo(){ if [[ "$debug" == "1" ]];then message="$(date +%s) $1"; echo "$message" 1>&2; logger "$message" >/dev/null 2>&1;fi }
+
+my_uci_get(){
+        if [ "$(uci get "$1" 2>&1 | grep "Entry not found" | wc -l)" == "1" ];then
+                debug_echo "$1 not found"  1>&2
+        else
+                echo -n "$(uci get "$1")"
+        fi
+}
+
+log_write(){
+	local LOG_PATH=/www/log_list
+	log_date="$(date "+%Y-%m-%d %H:%M:%S")"
+	log_content="$1"
+	log_line="$log_date $log_content"
+	log_num="$(wc -l "$LOG_PATH" | awk '{print $1}')"
+	[ -e "$LOG_PATH" ] || echo "$log_date sys:\"Start logging\"" > "$LOG_PATH"
+	if [ "$log_num" -gt 100 ];then
+		debug_echo "$LOG_PATH is too big  = $log_num"
+		sed -i "1i $log_line" "$LOG_PATH"
+		sed -i '101,$d' "$LOG_PATH"
+	else
+		debug_echo "$LOG_PATH is right = $log_num"
+		sed -i "1i $log_line" "$LOG_PATH"
+	fi
+	debug_echo "$log_line"
+	return 0
+}
+
+#生成时直接生成token，无需删除和时间戳
+generate_token(){
+	[ ! -d "/tmp/webapi_token/session" ] && mkdir -p /tmp/webapi_token/session
+	access_token="$(echo "$(date +%s)salt" | md5sum | awk '{print $1}')"
+	touch "/tmp/webapi_token/session/${access_token}"
+
+	echo -n "$access_token"
+}
+
+#不再检查时间，直接判断传递过来的 token 在 /tmp/webapi_token/session/ 中有没有
+check_token(){
+	token="$1"
+	if [ "$token" == "" ];then
+		return 1
+	fi
+
+	tokenfile="/tmp/webapi_token/session/${token}"
+	if [ -e "$tokenfile" ];then
+		return 0
+	else
+		return 1
+	fi
+}
+
+long_link(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	json_init
+	if [ -f /tmp/sysupgrade_lock ];then
+		json_add_string code "0"
+	else
+		json_add_string code "1"
+	fi
+	echo -n "$(json_dump)"
+}
+
+home_json(){
+	if [ -e "/var/run/anyos_data_collect.pid" ] ;then
+		if [ ! -e "/proc/$(cat /var/run/anyos_data_collect.pid)" ];then
+			(/usr/sbin/anywifi/rclocal.d/anyos_data_collect) 1>/dev/null 2>&1 &
+		fi
+	else
+		(/usr/sbin/anywifi/rclocal.d/anyos_data_collect) 1>/dev/null 2>&1 &
+	fi
+
+	while [ ! -f /tmp/anyos/home_json ]
+	do
+		sleep 1
+	done
+	echo -n "$(cat /tmp/anyos/home_json)"
+}
+
+bootflag(){
+	bootflag="$(my_uci_get anyos.boot.bootflag)"
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get bootflag success"
+	json_add_string bootflag "$bootflag"
+	echo -n "$(json_dump)"
+}
+
+setbootflag(){
+	body="$FORM_body"
+	json_load    "$body"
+	json_get_var bootflag bootflag
+	uci set anyos.boot.bootflag="$bootflag"
+	uci commit anyos
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set bootflag success"
+	json_add_string bootflag "$bootflag"
+	echo -n "$(json_dump)"
+}
+
+guide_commit(){
+	json_init
+	json_add_string code "1"
+	json_add_string reason "guide commit success"
+	json_add_string bootflag "$bootflag"
+	echo -n "$(json_dump)"
+
+	(/etc/init.d/network restart) &
+}
+
+get_system_status(){
+	UPTIME="$(cat /proc/uptime | awk -F '.' '{print $1}')"
+	LOAD_AVG="$(uptime | awk -F 'average:' '{print $2}' | sed 's/^[ \t]*//g' | awk -F ',' '{print $1 $2 $3}')"
+	CPU_USAGE="$((100 - $(top -n 1 | grep 'idle' | grep -v "grep" | awk '{print $8}' | awk -F '%' '{print $1}')))"
+
+	MEM_TOTAL="$(cat /proc/meminfo | grep MemTotal | awk '{print $2}')" #KB
+	MEM_FREE="$(cat /proc/meminfo | grep MemFree | awk '{print $2}')"   #KB
+	MEMORY_USAGE="$(printf "%d" $((100-MEM_FREE*100/MEM_TOTAL)))"
+
+	wifi_device_table="$(my_uci_get anyos.wifi.device_table)"
+	online_user_num=0
+	if [ "$wifi_device_table" != "0" ];then
+		# MTK use
+		wifi2_ifname="$(my_uci_get anyos.wifi.wifi2_ifname | awk '{print $1}')"
+		wifi5_ifname="$(my_uci_get anyos.wifi.wifi5_ifname | awk '{print $1}')"
+		[ "$wifi2_ifname" != "" ] && usernum1="$(iwpriv $wifi2_ifname get_mac_table | sed '1,2d' | sed '$d' | wc -l)"
+		[ "$wifi5_ifname" != "" ] && usernum2="$(iwpriv $wifi5_ifname get_mac_table | sed '1,2d' | sed '$d' | wc -l)"
+
+		# normol ues iw
+		# usernum1="$(iwinfo $wificard assoclist | grep dBm | wc -l)"
+		# usernum2="$(iwinfo $guestcard assoclist | grep dBm | wc -l)"
+
+		online_user_num="$((usernum1 + usernum2))"
+		debug_echo "usernum1 $usernum1 usernum2 $usernum2 online_user_num $online_user_num"
+	fi
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get system status success"
+	json_add_string uptime "$UPTIME"
+	json_add_string load_avg "$LOAD_AVG"
+	json_add_string cpu_usage "$CPU_USAGE"
+	json_add_string memory_usage "$MEMORY_USAGE"
+	json_add_string online_user_num "$online_user_num"
+	echo -n "$(json_dump)"
+}
+
+get_network_topology(){
+	wifi2="$(my_uci_get anyos.wifi.wifi2_ifname)"
+	[ ! -z "$wifi2" ] && wifi2=1
+	wifi5="$(my_uci_get anyos.wifi.wifi5_ifname)"
+	[ ! -z "$wifi5" ] && wifi5=1
+
+	wan_ifname="$(my_uci_get network.wan.ifname)"
+
+	net_status="none"
+	[ -f "/tmp/netstat.txt" ] && net_status="$(cat /tmp/netstat.txt)"
+	if [ "$net_status" == "none" ];then
+		internet_interface=none
+	elif [ "$net_status" == "$wan_ifname" -o "$net_status" == "pppoe-wan" ];then
+		internet_interface=ether
+	else
+		internet_interface=4g
+	fi
+
+	port_order="$(my_uci_get anyos.network.port_order)"
+	wan_type="$(my_uci_get anyos.network.wan_type)"
+	port_wan="$(my_uci_get anyos.network.port_wan)"
+	swconfig_info="$(swconfig dev switch0 show)"
+
+	port_stat=""
+	for port_cell in $port_order
+	do
+		if [ "$port_cell" != "w" ];then
+			if [ -z "$(echo "$swconfig_info" | grep "link: port:${port_cell} link:up")" ];then
+				port_stat="$port_stat 0"
+			else
+				port_stat="$port_stat 1"
+			fi
+		elif [ "$port_cell" == "w" ];then
+			if [ "$wan_type" == "switch" ];then
+				if [ -z "$(echo "$swconfig_info" | grep "link: port:${port_wan} link:up")" ];then
+					port_stat="$port_stat 0"
+				else
+					port_stat="$port_stat 1"
+				fi
+			elif [ "$wan_type" == "link" ];then
+				if [ -z "$(ip link | grep -w "$wan_ifname" | grep "state UP")" ];then
+					port_stat="$port_stat 0"
+				else
+					port_stat="$port_stat 1"
+				fi
+			fi
+		fi
+	done
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get status success"
+	json_add_string internet "$internet_interface"
+	json_add_string lan "1"
+	json_add_string wifi2 "$wifi2"
+	json_add_string wifi5 "$wifi5"
+
+	json_add_array "port"
+	for port_one in $port_stat
+	do
+		json_add_object
+		json_add_string status "$port_one"
+		json_close_object
+	done
+	json_close_array
+	echo -n "$(json_dump)"
+}
+
+#4G interface name is 4gwan
+get_wan_traffic(){
+	:
+}
+
+get_web_msg(){ #Info displayed in bottom
+	board="$(my_uci_get anyversion.device.device_model_displayname)"
+	if [ -z "$board" ];then
+		board="$(my_uci_get anyversion.device.device_model)"
+	fi
+	sysversion="$(my_uci_get anyversion.device.device_version)"
+	LAN_MACADDR="$(cat /sys/class/net/br-lan/address | tr 'a-z' 'A-Z')"
+	[ -z "$LAN_MACADDR" ] && LAN_MACADDR="00:00:00:00:00:00"
+	LAN_IPADDR="$(my_uci_get network.lan.ipaddr)"
+	[ -z "$LAN_IPADDR" ] && LAN_IPADDR="0.0.0.0"
+
+	[ -z "$board" ] && board="UNKNOWN"
+	[ -z "sysversion" ] && sysversion="0.0"
+	systime="$(date "+%s")"
+	uptime="$(cat /proc/uptime | awk -F '.' '{print $1}')"
+	mode="route"
+	timezone="$(my_uci_get system.@system[0].timezone | grep -oE "\-[0-9]+|\+[0-9]+" | grep -v "\-0")"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get web msg success"
+
+	json_add_object "data"
+	json_add_string board "$board"
+	json_add_string sysversion "$sysversion"
+	json_add_string macaddr "$LAN_MACADDR"
+	json_add_string ipaddr "$LAN_IPADDR"
+	json_add_string mode "$mode"
+	json_add_string systime "$systime"
+	json_add_string uptime "$uptime"
+	json_add_string authcode "$(cat /proc/authmode)"
+	json_add_string timezone "$timezone"
+	json_close_object
+	echo -n "$(json_dump)"
+}
+
+#接口实现在这里，对外提供在 webapi
+get_wan_status(){
+	wan_ubus_data="$(ubus call network.interface.wan status)"
+	json_load "$wan_ubus_data"
+	json_get_var WAN_UPTIME uptime
+
+	timestamp_current="$(date +%s)"
+	wan_ifname="$(my_uci_get network.wan.ifname)"
+	wan_proto="$(my_uci_get network.wan.proto)"
+	wan_macaddr="$(ifconfig "$wan_ifname" | awk '/HWaddr/{print $5}')"
+	[ "$wan_proto" == "pppoe" ] && wan_ifname="pppoe-wan"
+	wan_ipaddr="$(ifconfig "$wan_ifname" | grep "inet addr:" | awk -F ":" '{print $2}' | awk '{print $1}')"
+	wan_ipaddr6="$(ifconfig "$wan_ifname" | grep "inet6 addr:" | awk -F "addr:" '{print $2}' | awk '{print $1}')"
+	wan_ifname="$(my_uci_get network.wan.ifname)"
+	[ -z "$wan_ifname" ] && wan_ifname=NO_IFNAME
+
+	traffic_now="$(cat /proc/net/dev)"
+	wan_rx_current="$(echo "$traffic_now" | grep "$wan_ifname" | awk '{print $2}')"
+	wan_tx_current="$(echo "$traffic_now" | grep "$wan_ifname" | awk '{print $10}')"
+
+	#Content in file
+	if [ ! -f /tmp/anyos/get_wan_status ];then
+		wan_rx_speed=0
+		wan_tx_speed=0
+	else
+		#获取过去流量信息
+		. /tmp/anyos/get_wan_status
+		timestamp_diff="$((timestamp_current-timestamp_old))"
+		[ "$timestamp_diff" == "0" ] && timestamp_diff=1
+		#计算间隔时间
+		wan_rx_diff="$((wan_rx_current-wan_rx_old))"
+		wan_tx_diff="$((wan_tx_current-wan_tx_old))"
+
+		#计算速度
+		wan_rx_speed=$((wan_rx_diff/timestamp_diff))
+		wan_tx_speed=$((wan_tx_diff/timestamp_diff))
+
+		#过滤错误数值
+		if [ -z "$wan_rx_speed" ] || [ "$wan_rx_speed" -lt "0" ] || [ -z "$wan_tx_speed" ] || [ "$wan_tx_speed" -lt "0" ];then
+			wan_tx_speed="0"
+			wan_rx_speed="0"
+		fi
+	fi
+
+	#按格式打印时间戳和各个接口流量信息
+
+	echo "timestamp_old=${timestamp_current}" > /tmp/anyos/get_wan_status
+	echo "wan_rx_old=${wan_rx_current}" >> /tmp/anyos/get_wan_status
+	echo "wan_tx_old=${wan_tx_current}" >> /tmp/anyos/get_wan_status
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get wan status success"
+	json_add_object "data"
+	json_add_string rx "$wan_rx_speed"
+	json_add_string tx "$wan_tx_speed"
+	json_add_string txall "$wan_tx_current"
+	json_add_string rxall "$wan_rx_current"
+	json_add_string uptime "$WAN_UPTIME"
+	json_add_string proto "$wan_proto"
+	json_add_string ipaddr "$wan_ipaddr"
+	json_add_string macaddr "$wan_macaddr"
+
+	json_add_array "ipv6"
+	for value in $wan_ipaddr6
+	do
+		json_add_string addr "$value"
+	done
+	json_close_array
+
+	json_close_object
+	echo -n "$(json_dump)"
+}
+
+#从/etc/config/network 真实获取wan口的配置信息，实时获取
+get_wan_config(){
+	wan_ifname="$(my_uci_get network.wan.ifname)"
+	wan_macaddr="$(ifconfig "$wan_ifname" | awk '/HWaddr/{print $5}')"
+	wan_proto="$(my_uci_get network.wan.proto)"
+	[ "$wan_proto" == "pppoe" ] && wan_ifname="pppoe-wan"
+
+	wan_ifconfig="$(ifconfig "$wan_ifname")"
+	wan_gateway="$(route -n | grep "UG" | grep -w "$wan_ifname" | awk 'NR==1 {print $2}')"
+	wan_nameserver="$(cat /tmp/resolv.conf.auto | grep -A 1 -w "wan" | awk 'NR==2 {print $2}')"
+	wan_username="$(my_uci_get network.wan.username)"
+	wan_password="$(my_uci_get network.wan.password)"
+	wan_service="$(my_uci_get network.wan.service)"
+	wan_ac="$(my_uci_get network.wan.ac)"
+
+	dns_primary="$(my_uci_get network.wan.dns | awk -F ' ' '{print $1}')"
+	dns_secondary="$(my_uci_get network.wan.dns | awk -F ' ' '{print $2}')"
+
+	wan_ipaddr="$(echo "$wan_ifconfig" | grep "inet addr:" | awk -F ":" '{print $2}' | awk '{print $1}')"
+	wan_ipaddr6="$(echo "$wan_ifconfig" | grep "inet6 addr:" | awk -F "addr:" '{print $2}' | awk '{print $1}')"
+	wan_netmask="$(echo "$wan_ifconfig" | grep "inet addr:" | awk -F "Mask:" '{print $2}')"
+
+	if [ "$wan_proto" == "static" ]; then
+		wan_ipaddr="$(my_uci_get network.wan.ipaddr)"
+		wan_netmask="$(my_uci_get network.wan.netmask)"
+		wan_gateway="$(my_uci_get network.wan.gateway)"
+	elif [ "$wan_proto" == "dhcp" ];then
+		wan_ip="$(echo "$wan_ifconfig" | grep 'inet addr' | wc -l)"
+		if [ "$wan_ip" != "1" ]; then
+			wan_ipaddr="0.0.0.0"
+			wan_netmask="255.255.255.0"
+		fi
+	fi
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get wan config success"
+	json_add_object "data"
+	json_add_string username "$wan_username"
+	json_add_string password "$wan_password"
+	json_add_string proto "$wan_proto"
+	json_add_string macaddr "$wan_macaddr"
+	json_add_string dns_primary "$dns_primary"
+	json_add_string dns_secondary "$dns_secondary"
+	json_add_string ipaddr "$wan_ipaddr"
+	json_add_string netmask "$wan_netmask"
+	json_add_string gateway "$wan_gateway"
+	json_add_string nameserver "$wan_nameserver"
+	json_add_string service "$wan_service"
+	json_add_string ac "$wan_ac"
+
+	json_add_array "ipv6"
+	for value in $wan_ipaddr6
+	do
+		json_add_string addr "$value"
+	done
+	json_close_array
+
+	json_close_object
+
+	echo -n "$(json_dump)"
+}
+
+#{"access_token":"1111111111", "proto":"dhcp/static/pppoe", "username":"username", "password":"password",
+#"ipaddr":"192.168.8.111","netmask":"255.255.255.0", "gateway":"192.168.8.1","dns_primary":"114.114.114.114","dns_secondary":"8.8.8.8"}
+set_wan_config_nocommit(){
+	body="$FORM_body"
+	json_load    "$body"
+	json_get_var proto proto
+	json_get_var username username
+	json_get_var password password
+	json_get_var ipaddr ipaddr
+	json_get_var netmask netmask
+	json_get_var gateway gateway
+	json_get_var dns_primary dns_primary
+	json_get_var dns_secondary dns_secondary
+	json_get_var service service
+	json_get_var ac ac
+
+	#配置DNS,直接设置进去，如果为空则判断是否有gateway
+	if [ -z "$dns_primary" -a -n "$gateway" ];then
+		dns_primary="$gateway"
+	fi
+	uci set network.wan.dns="$dns_primary $dns_secondary"
+
+	if [ "$proto" == "static" ]; then
+		uci set network.wan.proto='static'
+		uci set network.wan.ipaddr="$ipaddr"
+		uci set network.wan.netmask="$netmask"
+		uci set network.wan.gateway="$gateway"
+	elif [ "$proto" == "dhcp" ]; then
+		uci set network.wan.proto='dhcp'
+	elif [ "$proto" == "pppoe" ]; then
+		if [ -z "$username" ] || [ -z "$password" ];then
+			json_init
+			json_add_string code "-6"
+			json_add_string reason "username and password can't be empty"
+			echo -n "$(json_dump)"
+			return
+		fi
+		uci set network.wan.proto='pppoe'
+		uci set network.wan.username="$username"
+		uci set network.wan.password="$password"
+		uci set network.wan.service="$service"
+		uci set network.wan.ac="$ac"
+
+	else
+		json_init
+		json_add_string code "-4"
+		json_add_string reason "Protocol should one of pppoe/static/dhcp"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set wan config success"
+	json_close_object
+
+	uci commit network
+	echo -n "$(json_dump)"
+}
+
+set_wan_config(){
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	set_wan_config_nocommit
+	(ifup wan) &
+	(log_content="net:\"change wan causes network restart\"";log_write "$log_content") &
+}
+
+pppoe_detection(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ -z "$(which pppoe-discovery)" ];then
+		pppoe_detection="Not support pppoe discovery"
+	else
+		wan_ifname="$(my_uci_get network.wan.ifname)"
+		pppoe_detection="$(pppoe-discovery -I "${wan_ifname}" 2>&1)"
+	fi
+	json_init
+	json_add_string code "1"
+	json_add_string reason "pppoe-discovery success"
+	json_add_object "data"
+	json_add_string pppoe_detection "$pppoe_detection"
+	json_close_object
+	echo -n "$(json_dump)"
+}
+
+pppoe_disconnect(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "pppoe disconnect success"
+	echo -n "$(json_dump)"
+	ifdown wan &
+}
+
+pppoe_reconnect(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "reconnect cmd exec success"
+	echo -n "$(json_dump)"
+
+	(ifdown wan;sleep 1;ifup wan)&
+}
+
+get_pppoe_status(){
+	wan_ifconfig="$(ifconfig pppoe-wan)"
+	wan_ipaddr="$(echo "$wan_ifconfig" | grep "inet addr:" | awk -F ":" '{print $2}' | awk '{print $1}')"
+	if [ -n "$wan_ipaddr" ];then
+		pppoe_status=1
+	else
+		pppoe_status=0
+	fi
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get_pppoe_status success"
+	json_add_string pppoe_status "$pppoe_status"
+	echo -n "$(json_dump)"
+}
+
+get_pptp_sl_status(){
+	pptp_ifconfig="$(ifconfig pptp-pptp)"
+	pptp_ip="$(echo "$pptp_ifconfig" | grep "inet addr" | awk -F ':' '{print $2}' | awk '{print $1}')"
+	if [ -n "$pptp_ip" ];then
+		pptp_status=1
+	else
+		pptp_status=0
+	fi
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get_pptp_sl_status success"
+	json_add_string pptp_status "$pptp_status"
+	echo -n "$(json_dump)"
+}
+
+get_l2tp_sl_status(){
+	l2tp_ifconfig="$(ifconfig l2tp-l2tp)"
+	l2tp_ip="$(echo "$l2tp_ifconfig" | grep "inet addr" | awk -F ':' '{print $2}' | awk '{print $1}')"
+	if [ -n "$l2tp_ip" ];then
+		l2tp_status=1
+	else
+		l2tp_status=0
+	fi
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get_l2tp_sl_status success"
+	json_add_string l2tp_status "$l2tp_status"
+	echo -n "$(json_dump)"
+}
+
+get_lan_status(){
+	lan_ubus_data="$(ubus call network.interface.lan status)"
+	json_load "$lan_ubus_data"
+	json_get_var LAN_UPTIME uptime
+
+	timestamp_current="$(date +%s)"
+	# 获取各个接口名称
+	lan_ifname="br-lan"
+
+	# 统计当前流量
+	traffic_now="$(cat /proc/net/dev)"
+	lan_rx_current="$(echo "$traffic_now"| grep "$lan_ifname" | awk '{print $2}')"
+	lan_tx_current="$(echo "$traffic_now"| grep "$lan_ifname" | awk '{print $10}')"
+	# Content in file
+	if [ ! -f /tmp/anyos/get_lan_status ];then
+		lan_rx_speed=0
+		lan_tx_speed=0
+	else
+		# 获取过去流量信息
+		. /tmp/anyos/get_lan_status
+		timestamp_diff="$((timestamp_current-timestamp_old))"
+		[ "$timestamp_diff" == "0" ] && timestamp_diff=1
+		# 计算间隔时间
+		lan_rx_diff="$((lan_rx_current-lan_rx_old))"
+		lan_tx_diff="$((lan_tx_current-lan_tx_old))"
+
+		# 计算速度
+		lan_rx_speed=$((lan_rx_diff/timestamp_diff))
+		lan_tx_speed=$((lan_tx_diff/timestamp_diff))
+
+		# 过滤错误数值
+		if [ -z "$lan_rx_speed" ] || [ "$lan_rx_speed" -lt "0" ] || [ -z "$lan_tx_speed" ] || [ "$lan_tx_speed" -lt "0" ];then
+			lan_tx_speed="0"
+			lan_rx_speed="0"
+		fi
+	fi
+	# 按格式打印时间戳和各个接口流量信息
+	echo "timestamp_old=${timestamp_current}" 	> /tmp/anyos/get_lan_status
+	echo "lan_rx_old=${lan_rx_current}" 		>> /tmp/anyos/get_lan_status
+	echo "lan_tx_old=${lan_tx_current}" 		>> /tmp/anyos/get_lan_status
+
+	lan_proto="$(my_uci_get network.lan.proto)"
+	LAN_IPADDR="$(my_uci_get network.lan.ipaddr)"
+	lan_ipaddr6="$(ifconfig "br-lan" | grep "inet6 addr:" | awk -F "addr:" '{print $2}' | awk '{print $1}')"
+	LAN_MACADDR="$(cat /sys/class/net/br-lan/address | tr 'a-z' 'A-Z')"
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get lan status success"
+	json_add_object "data"
+	json_add_string rx "$lan_rx_speed"
+	json_add_string tx "$lan_tx_speed"
+	json_add_string rxall "$lan_rx_current"
+	json_add_string txall "$lan_tx_current"
+	json_add_string uptime "$LAN_UPTIME"
+	json_add_string proto "$lan_proto"
+	json_add_string ipaddr "$LAN_IPADDR"
+	json_add_string macaddr "$LAN_MACADDR"
+
+        json_add_array "ipv6"
+        for value in $lan_ipaddr6
+        do
+                json_add_string addr "$value"
+        done
+        json_close_array
+
+	json_close_object
+	echo -n "$(json_dump)"
+}
+
+#实时从/etc/config/network 获取配置信息，注意添加
+get_lan_config(){
+	lan_proto="$(my_uci_get network.lan.proto)"
+	LAN_IPADDR="$(my_uci_get network.lan.ipaddr)"
+	[ -z "$LAN_IPADDR" ] && LAN_IPADDR="0.0.0.0"
+	LAN_NETMASK="$(my_uci_get network.lan.netmask)"
+	LAN_MACADDR="$(cat /sys/class/net/br-lan/address | tr 'a-z' 'A-Z')"
+	[ -z "$LAN_MACADDR" ] && LAN_MACADDR="00:00:00:00:00:00"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get lan config success"
+
+	json_add_object "data"
+
+	json_add_string proto "$lan_proto"
+	json_add_string ipaddr "$LAN_IPADDR"
+	json_add_string netmask "$LAN_NETMASK"
+	json_add_string macaddr "$LAN_MACADDR"
+
+	json_close_object
+
+	echo -n "$(json_dump)"
+}
+
+set_lan_config(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	ipaddr="$FORM_ipaddr"
+	netmask="$FORM_netmask"
+
+	if [ -z "$ipaddr" -o -z "$netmask" ];then
+		json_init
+		json_add_string code "4"
+		json_add_string reason "missing ipaddr or netmask"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	uci set network.lan.ipaddr=$ipaddr
+	uci set network.lan.netmask=$netmask
+	uci commit network
+	dhcp_map_ip="my_uci_get dhcp.@dnsmasq[0].address | awk -F '/' '{print $3}'"
+	if [ "$ipaddr" != "$dhcp_map_ip" ];then
+			uci delete dhcp.@dnsmasq[0].address
+			uci add_list dhcp.@dnsmasq[0].address="/router.epplink.net/${ipaddr}"
+			uci commit dhcp
+	fi
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set lan config success"
+	json_add_object data
+	json_add_string ipaddr "$ipaddr"
+	json_add_string netmask "$netmask"
+	json_close_object
+
+	echo -n "$(json_dump)"
+	sleep 1
+	(/etc/init.d/network restart) &
+	(wifi) &
+	[ -e /etc/init.d/any_samba ] && (/etc/init.d/any_samba restart) &
+	(log_content="net:\"change lan ip = $ipaddr then network restart\"";log_write "$log_content") &
+}
+
+get_dhcp_config(){
+	lan_dhcp="$(my_uci_get dhcp.lan.ignore)"
+	if [ "$lan_dhcp" != "1" ]; then
+		enabled="1"
+	else
+		enabled="0"
+	fi
+
+	dhcp_head="$(my_uci_get network.lan.ipaddr | awk -F. '{print $1"."$2"."$3}')"
+
+	start="$(my_uci_get dhcp.lan.start)"
+	limit="$(my_uci_get dhcp.lan.limit)"
+	end=$((start+limit))
+
+	#leasetime (unit: seconds)
+	leasetime="$(my_uci_get dhcp.lan.leasetime)"
+	dhcp_option="$(my_uci_get dhcp.lan.dhcp_option)"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get dhcp config success"
+	json_add_object "data"
+	json_add_string dhcp_enabled "$enabled"
+	json_add_string dhcp_start "$start"
+	json_add_string dhcp_end "$end"
+	json_add_string dhcp_lease "$leasetime"
+	json_add_string dhcp_head "$dhcp_head"
+	json_add_string dhcp_option "$dhcp_option"
+	json_close_object
+
+	echo -n "$(json_dump)"
+}
+
+set_dhcp_config(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	dhcp_enabled="$FORM_dhcp_enabled"
+	dhcp_start="$FORM_dhcp_start"
+	dhcp_end="$FORM_dhcp_end"
+	dhcp_lease="$FORM_dhcp_lease"
+	dhcp_option="$FORM_dhcp_option"
+
+	if [ "$dhcp_enabled" == "1" ]; then
+		uci set dhcp.lan.ignore="0"
+	else
+		uci set dhcp.lan.ignore="1"
+	fi
+
+	[ -z "$dhcp_start" ] && dhcp_start=100
+	[ -z "$dhcp_end" ] && dhcp_end=200
+
+	if [ "$dhcp_end" -lt 1 ] || [ "$dhcp_end" -ge 255 ] || [ "$dhcp_start" -lt 1 ] || [ "$dhcp_start" -ge 255 ]; then
+		json_init
+		json_add_string code "-4"
+		json_add_string reason "set dhcp parameter error"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ "$dhcp_start" -ge "$dhcp_end" ]; then
+		json_init
+		json_add_string code "-6"
+		json_add_string reason "set dhcp parameter error"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	uci set dhcp.lan.start="$dhcp_start"
+	uci set dhcp.lan.limit="$((dhcp_end-dhcp_start))"
+	uci set dhcp.lan.leasetime="$dhcp_lease"
+	uci set dhcp.lan.dhcp_option="$dhcp_option"
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set dhcp config success"
+
+	echo -n "$(json_dump)"
+
+	uci commit dhcp
+	/etc/init.d/dnsmasq restart
+}
+
+get_dhcp_allocation(){
+	dhcp_data="$(cat /tmp/dhcp.leases)"
+	now_date="$(date +%s)"
+	dhcp_num="$(echo "$dhcp_data" | wc -l)"
+
+	if [ "$dhcp_num" == "0" ];then
+		json_init
+		json_add_string code "1"
+		json_add_string reason "get dhcp allocation success"
+		json_add_array 'data'
+		json_close_array
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get dhcp allocation success"
+	json_add_array 'data'
+
+	dhcp_count=1
+	while [ "$dhcp_count" -le "$dhcp_num" ]
+	do
+		eval $(echo "$dhcp_data" | awk 'NR=="'"$dhcp_count"'" {printf("dhcp_lease=%s; dhcp_mac=%s; dhcp_ip=%s; dhcp_host=%s; NR=%s\n",$1,$2,$3,$4,NR)}')
+		dhcp_remain_lease="$((dhcp_lease - now_date))"
+		if [ -z "$dhcp_remain_lease" ] || [ "$dhcp_remain_lease" -lt 0 ];then
+			dhcp_count="$((dhcp_count + 1))"
+			continue
+		fi
+
+		json_add_object
+			json_add_string dhcp_remain_lease "$dhcp_remain_lease"
+			json_add_string dhcp_mac "$dhcp_mac"
+			json_add_string dhcp_ip "$dhcp_ip"
+			json_add_string dhcp_host "$dhcp_host"
+		json_close_object
+		dhcp_count="$((dhcp_count + 1))"
+	done
+
+	json_close_array
+	echo -n "$(json_dump)"
+}
+
+get_wifi_client(){
+	wifi_ifname_cnt=1
+	arp_list="$(cat /proc/net/arp)"
+	wifi2_ifname1="$(my_uci_get anyos.wifi.wifi2_ifname | awk '{print $1}')"
+	wifi5_ifname1="$(my_uci_get anyos.wifi.wifi5_ifname | awk '{print $1}')"
+	all_ifname="$wifi2_ifname1 $wifi5_ifname1"
+
+	device_table="$(my_uci_get anyos.wifi.device_table)"
+	if [ "$device_table" == "0" ];then
+		json_init
+		json_add_string code  "1"
+		json_add_string device_table  "$device_table"
+		echo -n "$(json_dump)"
+		return
+	else
+		device_table=1
+	fi
+
+	json_init
+	json_add_string code  "1"
+	json_add_string device_table  "$device_table"
+	json_add_string reason "get wifi clinet success"
+	json_add_array "list"
+
+	for wifi_card in $all_ifname
+	do
+	wifi_data="$(iwpriv "$wifi_card" get_mac_table | sed '1,2d' | sed '$d')"
+	wifi_num="$(echo "$wifi_data" | wc -l)"
+	count=1
+	while [ "$count" -le "$wifi_num" ] && [ -n "$wifi_data" ];do
+		wifi_line="$(echo "$wifi_data" | sed -n "${count}p")"
+
+			macaddr="$(echo "$wifi_line" | awk '{print $1}' | tr 'a-z' 'A-Z')"
+			macaddr="${macaddr:0:2}:${macaddr:2:2}:${macaddr:4:2}:${macaddr:6:2}:${macaddr:8:2}:${macaddr:10:2}"
+			[ "$macaddr" == ":::::" ] && macaddr=""
+			operation="$(awk '$9=="'"$macaddr"'" {print $11}' /etc/firewall.user)"
+			[ -z "$operation" ] && operation=ACCEPT
+			ipaddr="$(echo "$arp_list" | grep -i "$macaddr" | awk '$3~/0x2/{print $1}')"
+			ap="$(echo "$wifi_line" | awk '{print $2}')"
+
+			if [ "$wifi_card" == "$wifi2_ifname1" ];then
+				wifi_type="2.4G"
+				if [ "$ap" == "0" ];then
+					wifi_ssid="$(my_uci_get wireless.default_radio0.ssid)"
+				elif [ "$ap" == "1" ];then
+					wifi_ssid="$(my_uci_get wireless.guest_wifi.ssid)"
+				fi
+			fi
+
+			if [ "$wifi_card" == "$wifi5_ifname1" ];then
+				wifi_type="5.8G"
+				if [ "$ap" == "0" ];then
+					wifi_ssid="$(my_uci_get wireless.default_radio1.ssid)"
+				elif [ "$ap" == "1" ];then
+					wifi_ssid="$(my_uci_get wireless.guest_wifi1.ssid)"
+				fi
+			fi
+			wifi_type_ssid="${wifi_type}/${wifi_ssid}"
+
+			iw_date="$(iwpriv "$wifi_card" stat)"
+			rssi="$(echo "$iw_date" | grep RSSI | awk '{print $3}' | tail -n 1)"
+			rssi1="$(echo "$iw_date" | grep RSSI | awk '{print $4}' | tail -n 1)"
+
+			MCS="$(echo "$iw_date" | grep "Last RX Rate" | awk -F '=' '{print $2}' | awk -F ',' '{print $1}' | tr -d ' MCS')"
+			bandwidth="$(echo "$iw_date" | grep "Last RX Rate" | sed 's/.*\([0-9]\{2\}M\).*/\1/g')"
+			#mt7663 is special model
+			if [ "$wifi_type" == "5.8G" ];then
+				wifi_device="$(my_uci_get anyos.wifi.wifi5_device)"
+				if [ "$wifi_device" == mt7663 ];then
+					MCS="$(echo "$iw_date" | grep "Last RX Rate" | sed 's/.*NSS[0-9]_MCS\([0-9]\).*/\1/g')"
+					bandwidth="$(echo "$iw_date" | grep "Last RX Rate" | sed 's/.*BW\([0-9]\{2\}\).*/\1/g')"
+				fi
+			fi
+
+			case $bandwidth in
+				20M|\
+				40M)
+				MCS_SIGN=1
+				if [ "$MCS" -gt 7 ];then
+					MCS="$((MCS - 8))"
+					MCS_SIGN=2
+				fi
+				;;
+				80M) MCS_SIGN="$(echo "$iw_date" | grep "Last RX Rate" | sed 's/.*\([0-9]\)SS.*/\1/g')"
+				;;
+				20|\
+				40|\
+				80)
+				MCS_SIGN="$(echo "$iw_date" | grep "Last RX Rate" | sed 's/.*NSS\([0-9]\)_.*/\1/g')"
+				bandwidth="${bandwidth}M"
+			esac
+
+			GI="$(echo "$iw_date" | grep "Last RX Rate" | sed 's/.*\(.GI\).*/\1/g')"
+			speed=0
+
+			if [ "$bandwidth" == "20M" ];then
+				if [ "$GI" == "SGI" ];then
+					case $MCS in
+						0) speed="7.2Mbps"
+						;;
+						1) speed="14.4Mbps"
+						;;
+						2) speed="21.7Mbps"
+						;;
+						3) speed="28.9Mbps"
+						;;
+						4) speed="43.3Mbps"
+						;;
+						5) speed="57.8Mbps"
+						;;
+						6) speed="65.0Mbps"
+						;;
+						7) speed="72.2Mbps"
+						;;
+						*) speed="7.2Mbps"
+						;;
+					esac
+				elif [ "$GI" == "LGI" ];then
+					case $MCS in
+						0) speed="6.5Mbps"
+						;;
+						1) speed="13.0Mbps"
+						;;
+						2) speed="19.5Mbps"
+						;;
+						3) speed="26.0Mbps"
+						;;
+						4) speed="39.0Mbps"
+						;;
+						5) speed="52.0Mbps"
+						;;
+						6) speed="58.5Mbps"
+						;;
+						7) speed="65.0Mbps"
+						;;
+						*) speed="6.5Mbps"
+						;;
+					esac
+				fi
+			elif [ "$bandwidth" == "40M" ];then
+				if [ "$GI" == "SGI" ];then
+					case $MCS in
+						0) speed="15.0Mbps"
+						;;
+						1) speed="30.0Mbps"
+						;;
+						2) speed="45.0Mb/s"
+						;;
+						3) speed="60.0Mbps"
+						;;
+						4) speed="90.0Mbps"
+						;;
+						5) speed="120.0Mbps"
+						;;
+						6) speed="135.0Mbps"
+						;;
+						7) speed="150.0Mbps"
+						;;
+						*) speed="15.0Mbps"
+						;;
+					esac
+				elif [ "$GI" == "LGI" ];then
+					case $MCS in
+						0) speed="13.5Mbps"
+						;;
+						1) speed="27.0Mbps"
+						;;
+						2) speed="40.5Mbps"
+						;;
+						3) speed="54.0Mbps"
+						;;
+						4) speed="81.0Mbps"
+						;;
+						5) speed="108.0Mbps"
+						;;
+						6) speed="121.5Mbps"
+						;;
+						7) speed="135.0Mbps"
+						;;
+						*) speed="13.5Mbps"
+						;;
+					esac
+				fi
+			fi
+
+			#80M is used in 802.11ac model,it have 9 class
+			if [ "$bandwidth" == "80M" ];then
+				if [ "$GI" == "SGI" ];then
+					case $MCS in
+						0) speed="32.5Mbps"
+						;;
+						1) speed="65Mbps"
+						;;
+						2) speed="97.5Mbps"
+						;;
+						3) speed="130Mbps"
+						;;
+						4) speed="195Mbps"
+						;;
+						5) speed="260Mbps"
+						;;
+						6) speed="292.5Mbps"
+						;;
+						7) speed="325Mbps"
+						;;
+						8) speed="390Mbps"
+						;;
+						9) speed="433.3Mbps"
+						;;
+						*) speed="32.5Mbps"
+						;;
+					esac
+				elif [ "$GI" == "LGI" ];then
+					case $MCS in
+						0) speed="29.3Mbps"
+						;;
+						1) speed="58.5Mbps"
+						;;
+						2) speed="87.8Mbps"
+						;;
+						3) speed="117Mbps"
+						;;
+						4) speed="175.5Mbps"
+						;;
+						5) speed="234Mbps"
+						;;
+						6) speed="263.3Mbps"
+						;;
+						7) speed="292.5Mbps"
+						;;
+						8) speed="351Mbps"
+						;;
+						9) speed="390Mbps"
+						;;
+						*) speed="29.3Mbps"
+						;;
+					esac
+				fi
+			fi
+
+			if [ "$MCS_SIGN" == "2" ];then
+				speed="$(echo "$speed" | tr -d 'Mbps')"
+				speed="$(echo "$speed" "$speed" | awk '{printf("%0.1fMbps\n",$1 + $2)}')"
+			fi
+
+			if [ "$wifi_ifname_cnt" == 1 ];then
+				bandwidth="$(my_uci_get wireless.$wifi2_ifname1.bw)"
+			else
+				bandwidth="$(my_uci_get wireless.$wifi5_ifname1.bw)"
+			fi
+			if [ "$bw" == 1 ];then
+				bandwidth=20M
+			elif [ "$bw" == 2 ];then
+				bandwidth=40M
+			elif [ "$bw" == 3 ];then
+				bandwidth=80M
+			else
+				bandwidth=20M
+			fi
+			#TODO 查询单个ap的speed rssi rssi1
+			json_add_object
+			json_add_string interface "$wifi_type_ssid"
+			json_add_string macaddr	  "$macaddr"
+			json_add_string ipaddr    "$ipaddr"
+			json_add_string rssi      "$rssi"
+			json_add_string rssi1      "$rssi1"
+			json_add_string RX	  "$speed"
+			json_add_string bandwidth 	  "$bandwidth"
+			json_add_string operation 	  "$operation"
+			json_close_object
+			count="$((count + 1))"
+	done
+	wifi_ifname_cnt="$(wifi_ifname_cnt+1)"
+done
+	json_close_array
+	echo -n "$(json_dump)"
+}
+
+set_wifi_client(){
+	json_load "$FORM_body"
+	json_get_var macaddr macaddr
+	json_get_var operation operation
+
+	if [ -z "$macaddr" -o -z "$operation" ];then
+		json_init
+		json_add_string code "-4"
+		json_add_string reason "missing parameters err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		return_operation="$(awk '$9=="'"$macaddr"'" {print $11}' /etc/firewall.user)"
+		[ -z "$return_operation" ] && return_operation=ACCEPT
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		json_add_string return_operation  "$return_operation"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	iptables_judge="$(grep -wi "$macaddr" /etc/firewall.user)"
+	if [ -z "$iptables_judge" ] && [ "$operation" = "REJECT" ];then
+		echo "iptables -t filter -I FORWARD -m mac --mac-source "$macaddr" -j "$operation"" >> /etc/firewall.user
+	elif [ -n "$iptables_judge" ];then
+		if [ "$operation" = "REJECT" ];then
+			sed -i "s/.*$macaddr.*/iptables -t filter -I FORWARD -m mac --mac-source $macaddr -j $operation/" /etc/firewall.user
+		else
+			sed -i "/.*$macaddr.*/d" /etc/firewall.user
+		fi
+	fi
+	json_init
+	json_add_string code  "1"
+	json_add_string reason  "set wifi client success"
+	json_add_string return_operation  "$operation"
+
+	echo -n "$(json_dump)"
+	/etc/init.d/firewall restart &
+}
+
+get_arp(){
+	json_init
+	json_add_string code '1'
+	json_add_string reason 'success'
+	json_add_array "list"
+
+	while read line;do
+		if [ -n "$(echo "$line" | grep "Flags\|00:00:00:00:00:00")" ];then
+			continue
+		fi
+		if [ -n "$(echo "$line" | awk '{print $3}' | grep "0x0")" ];then
+			continue
+		fi
+		json_add_object
+			json_add_string ipaddr "$(echo "$line" | awk '{print $1}')"
+			json_add_string macaddr "$(echo "$line" | awk '{print $4}')"
+			json_add_string interface "$(echo "$line" | awk '{print $6}')"
+		json_close_object
+	done < /proc/net/arp
+
+	json_close_array
+	echo -n "$(json_dump)"
+}
+
+#Set nat accelaration switch
+get_nat_acceleration(){
+	nat_acceleration="$(my_uci_get anyos.firewall.nat_acceleration)"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get net acceleration success"
+	json_add_object "data"
+
+	if [ "$nat_acceleration" == "1" ]; then
+		json_add_string status "1"
+	else
+		json_add_string status "0"
+	fi
+	json_close_object
+	echo -n "$(json_dump)"
+}
+
+set_nat_acceleration(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ "$FORM_status" == "1" ]; then
+		uci set anyos.firewall.nat_acceleration='1'
+	else
+		uci set anyos.firewall.nat_acceleration='0'
+	fi
+
+	uci commit anyos
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set net acceleration success"
+	echo -n "$(json_dump)"
+}
+#QOS
+get_qos(){
+	qos_list="$(uci show any_ratelimit | sed -n 's/any_ratelimit.\(qos[0-9]\+\)=info/\1/p')"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get_qos success"
+	json_add_array 'data'
+	for qos_tmp in ${qos_list}
+	do
+		qos_section="${qos_tmp:3}"
+		ip="$(uci -q get any_ratelimit.${qos_tmp}.ip)"
+		uprate="$(uci -q get any_ratelimit.${qos_tmp}.uprate)"
+		downrate="$(uci -q get any_ratelimit.${qos_tmp}.downrate)"
+		description="$(uci -q get any_ratelimit.${qos_tmp}.description)"
+		json_add_object
+		json_add_string qos_section "$qos_section"
+		json_add_string ip 			"$ip"
+		json_add_string uprate 		"$uprate"
+		json_add_string downrate	"$downrate"
+		json_add_string description "$description"
+		json_close_object
+	done
+	json_close_array
+	echo -n "$(json_dump)"
+}
+
+set_qos(){
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	json_load   "$FORM_body"
+	json_get_var qos_section qos_section
+	json_get_var ip	ip
+	json_get_var uprate uprate
+	json_get_var downrate downrate
+	json_get_var description description
+	json_get_var qos_section_old qos_section_old
+	json_get_var qos_section_delete qos_section_delete
+
+	uprate_judge="$(echo "$uprate" | tr -d "[0-9]")"
+	downrate_judge="$(echo "$downrate" | tr -d "[0-9]")"
+
+	if [ -n "$uprate_judge" ] || [ -n "$downrate_judge" ];then
+		json_init
+		json_add_string code "6"
+		json_add_string reason "qos uprate downrate_judge must use num"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ -z "$ip" ];then
+		json_init
+		json_add_string code "4"
+		json_add_string reason "qos ip must not be null"
+		echo -n "$(json_dump)"
+		return
+	fi
+	[ -e /etc/config/any_ratelimit ] || touch /etc/config/any_ratelimit
+	section="$(uci show firewall | awk -F '.' '/firewall.ratelimit/ {print $2}')"
+	if [ -z "$section" ];then
+		section="$(uci add firewall include)"
+		uci set firewall.${section}.path="/usr/sbin/anywifi/firewall.ratelimit"
+	fi
+	qos_enabled="$(my_uci_get any_ratelimit.main.qos_enabled)"
+	qos_enabled="$((qos_enabled ^ 0))"
+	uci set firewall.${section}.enabled="$qos_enabled"
+	uci commit firewall
+	if [ -z "$qos_section" ];then
+		max_qos="$(uci show any_ratelimit | sed -n 's/any_ratelimit.qos\([0-9]\+\)=info/\1/p' | sort -rn | sed -n 1p)"
+		qos_section="$((max_qos + 1))"
+	fi
+
+	qos_section="${qos_section:+qos$qos_section}"
+	qos_section_old="${qos_section_old:+qos$qos_section_old}"
+	if [ "$qos_section_delete" == 1 ];then
+		#删除 qos_section
+		qos_judge="$(uci show any_ratelimit | sed -n 's/any_ratelimit.\('$qos_section'\)=info/\1/p')"
+		if [ -z "$qos_judge" ];then
+			json_init
+			json_add_string code "2"
+			json_add_string reason	"qos_section delete fail,no have $qos_section qos_section"
+			echo -n "$(json_dump)"
+			return
+		else
+			uci delete any_ratelimit.${qos_judge}
+			uci commit any_ratelimit
+			json_init
+			json_add_string code "1"
+			json_add_string reason	"delete qos_section $qos_section success"
+			echo -n "$(json_dump)"
+			(/etc/init.d/firewall restart)&
+			return
+		fi
+	fi
+
+	if [ -n "$qos_section_old" ];then
+		qos_old_judge="$(uci show any_ratelimit | sed -n 's/any_ratelimit.\('$qos_section_old'\)=info/\1/p')"
+		if [ -z "$qos_old_judge" ];then
+			json_init
+			json_add_string code "8"
+			json_add_string reason	"qos_section_old change fail,no have $qos_section_old"
+			echo -n "$(json_dump)"
+			return
+		fi
+		uci set any_ratelimit.${qos_old_judge}.ip="$ip"
+		uci set any_ratelimit.${qos_old_judge}.uprate="$uprate"
+		uci set any_ratelimit.${qos_old_judge}.downrate="$downrate"
+		uci set any_ratelimit.${qos_old_judge}.description="$description"
+	else
+		uci set any_ratelimit.${qos_section}="info"
+		uci set any_ratelimit.${qos_section}.ip="$ip"
+		uci set any_ratelimit.${qos_section}.uprate="$uprate"
+		uci set any_ratelimit.${qos_section}.downrate="$downrate"
+		uci set any_ratelimit.${qos_section}.description="$description"
+	fi
+	uci commit any_ratelimit
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"set qos success"
+	echo -n "$(json_dump)"
+	(/etc/init.d/firewall restart)&
+}
+
+get_qos_status(){
+	qos_enabled="$(my_uci_get any_ratelimit.main.qos_enabled)"
+	qos_enabled="$((qos_enabled ^ 0))"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"get_qos_status success"
+	json_add_string qos_enabled	"$qos_enabled"
+	echo -n "$(json_dump)"
+}
+
+set_qos_status(){
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	json_load   "$FORM_body"
+	json_get_var qos_enabled qos_enabled
+	qos_enabled="$((qos_enabled ^ 0))"
+
+	section="$(uci show firewall | awk -F '.' '/firewall.ratelimit/ {print $2}')"
+	if [ -z "$section" ];then
+		section="$(uci add firewall include)"
+		uci set firewall.${section}.path="/usr/sbin/anywifi/firewall.ratelimit"
+	fi
+	uci set firewall.${section}.enabled="$qos_enabled"
+	uci commit firewall
+
+	if [ ! -e /etc/config/any_ratelimit ];then
+		touch /etc/config/any_ratelimit
+	fi
+	uci set any_ratelimit.main="defaults"
+	uci set any_ratelimit.main.qos_enabled="$qos_enabled"
+	uci commit any_ratelimit
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"set_qos_status success"
+	echo -n "$(json_dump)"
+	(/etc/init.d/firewall restart)&
+}
+
+get_4g(){
+	module_section_list="$(uci show network | sed -n 's/network.\(4gwan[0-9]*\)\+=interface/\1/p' | sort)"
+	if [ -z "$module_section_list" ];then
+		json_init
+		json_add_string code "-4"
+		json_add_string reason "there is no 4g interface"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	module_section="$FORM_module_section"
+	if [ -z "$module_section" ];then
+		module_section="$(echo "$module_section_list" | sed -n 1p)"
+	fi
+	mobile_priority="$(my_uci_get anyos_netwatchdog.device.mobile_priority)"
+	module_first="$(my_uci_get anyos_netwatchdog.device.module_first)"
+	SIMX="$FORM_SIMX"
+	if [ -n "$SIMX" ];then
+		if [ -e /etc/config/netcard_db ];then
+			busnum="$(my_uci_get network.${module_section}.busnum)"
+			gpio_default_value="$(my_uci_get netcard_db.bus${busnum}.gpio_default_value)"
+			if [ "$gpio_default_value" = 0 ];then
+				apn="$(my_uci_get netcard_db.bus${busnum}.apn0)"
+				pin="$(my_uci_get netcard_db.bus${busnum}.pin0)"
+				dialnumber="$(my_uci_get netcard_db.bus${busnum}.dialnumber0)"
+				username="$(my_uci_get netcard_db.bus${busnum}.username0)"
+				password="$(my_uci_get netcard_db.bus${busnum}.password0)"
+			elif [ "$gpio_default_value" = 1 ];then
+				apn="$(my_uci_get netcard_db.bus${busnum}.apn1)"
+				pin="$(my_uci_get netcard_db.bus${busnum}.pin1)"
+				dialnumber="$(my_uci_get netcard_db.bus${busnum}.dialnumber1)"
+				username="$(my_uci_get netcard_db.bus${busnum}.username1)"
+				password="$(my_uci_get netcard_db.bus${busnum}.password1)"
+			fi
+		elif [ -e /etc/config/netcard ];then
+			gpio_default_value="$(uci -q show netcard.device | sed -n 's/netcard.*value\([01]\)_sim='\'$SIMX\''/\1/p')"
+			if [ "$gpio_default_value" = 0 ];then
+				apn="$(my_uci_get netcard.device.apn0)"
+				pin="$(my_uci_get netcard.device.pin0)"
+				dialnumber="$(my_uci_get netcard.device.dialnumber0)"
+				username="$(my_uci_get netcard.device.username0)"
+				password="$(my_uci_get netcard.device.password0)"
+			elif [ "$gpio_default_value" = 1 ];then
+				apn="$(my_uci_get netcard.device.apn1)"
+				pin="$(my_uci_get netcard.device.pin1)"
+				dialnumber="$(my_uci_get netcard.device.dialnumber1)"
+				username="$(my_uci_get netcard.device.username1)"
+				password="$(my_uci_get netcard.device.password1)"
+			fi
+		fi
+	else
+		apn="$(my_uci_get network.${module_section}.apn)"
+		pin="$(my_uci_get network.${module_section}.pin)"
+		dialnumber="$(my_uci_get network.${module_section}.dialnumber)"
+		username="$(my_uci_get network.${module_section}.username)"
+		password="$(my_uci_get network.${module_section}.password)"
+	fi
+
+	if [ -e "/etc/config/netcard_db" ];then
+	#多模块
+		busnum="$(my_uci_get network.${module_section}.busnum)"
+		gpio_default_value="$(my_uci_get netcard_db.bus${busnum}.gpio_default_value)"
+		if [ "$gpio_default_value" = 0 ] && [ -z "$SIMX" ];then
+			SIMX="$(my_uci_get netcard_db.bus${busnum}.value0_sim)"
+		elif [ "$gpio_default_value" = 1 ] && [ -z "$SIMX" ];then
+			SIMX="$(my_uci_get netcard_db.bus${busnum}.value1_sim)"
+		fi
+		if [ "$gpio_default_value" = 0 ];then
+			sim_set="$(my_uci_get netcard.device.value0_sim)"
+		elif [ "$gpio_default_value" = 1 ];then
+			sim_set="$(my_uci_get netcard.device.value1_sim)"
+		fi
+		switch_sim_enabled="$(my_uci_get netcard_db.bus${busnum}.switch_sim_enabled)"
+		switch_sim_enabled="$((switch_sim_enabled ^ 0))"
+	elif [ -e "/etc/config/netcard" ];then
+	#单模块
+		gpio_default_value="$(my_uci_get netcard.device.gpio_default_value)"
+		if [ "$gpio_default_value" = 0 ] && [ -z "$SIMX" ];then
+			SIMX="$(my_uci_get netcard.device.value0_sim)"
+		elif [ "$gpio_default_value" = 1 ] && [ -z "$SIMX" ];then
+			SIMX="$(my_uci_get netcard.device.value1_sim)"
+		fi
+		if [ "$gpio_default_value" = 0 ];then
+			sim_set="$(my_uci_get netcard.device.value0_sim)"
+		elif [ "$gpio_default_value" = 1 ];then
+			sim_set="$(my_uci_get netcard.device.value1_sim)"
+		fi
+		switch_sim_enabled="$(my_uci_get netcard.device.switch_sim_enabled)"
+		switch_sim_enabled="$((switch_sim_enabled ^ 0))"
+		auth_apn="$(my_uci_get netcard.device.auth_apn)"
+		auth_apn="$((auth_apn ^ 0))"
+	fi
+	json_init
+	json_add_object "data"
+	json_add_string apn "$apn"
+	json_add_string pin "$pin"
+	json_add_string dialnumber "$dialnumber"
+	json_add_string username "$username"
+	json_add_string password "$password"
+	json_add_string mobile_priority "$mobile_priority"
+	json_add_string module_first "$module_first"
+	json_add_string SIMX "$SIMX"
+	json_add_string switch_sim_enabled "$switch_sim_enabled"
+	json_add_string auth_apn "$auth_apn"
+	json_add_string sim_set "$sim_set"
+	json_close_object
+	json_add_array "module_section_list"
+	for module_section_tmp in $module_section_list
+	do
+		json_add_string module_section_tmp "$module_section_tmp"
+	done
+	json_close_array
+
+	json_add_array "sim_list"
+	if [ -n "$gpio_default_value" ];then
+		if [ -e "/etc/config/netcard_db" ];then
+		#多模块
+			value0_sim="$(my_uci_get netcard_db.bus${busnum}.value0_sim)"
+			value1_sim="$(my_uci_get netcard_db.bus${busnum}.value1_sim)"
+			json_add_string value0_sim "$value0_sim"
+			json_add_string value1_sim "$value1_sim"
+		elif [ -e "/etc/config/netcard" ];then
+		#单模块
+			value0_sim="$(my_uci_get netcard.device.value0_sim)"
+			value1_sim="$(my_uci_get netcard.device.value1_sim)"
+			json_add_string value0_sim "$value0_sim"
+			json_add_string value1_sim "$value1_sim"
+		fi
+	fi
+	json_close_array
+
+	json_add_string code "1"
+	json_add_string reason "get 4g config success"
+
+	echo -n "$(json_dump)"
+}
+
+#{"access_token":"111111111", "apn":"1234", "dialnumber":"#999", "pin":"1234", "username":"ctnet@mycdma.cn", "password":"vnet.mobi"}
+set_4g(){
+	body="$FORM_body"
+	access_token="$FORM_access_token"
+	json_load "$body"
+	json_get_var apn apn
+	json_get_var dialnumber dialnumber
+	json_get_var pin pin
+	json_get_var username username
+	json_get_var password password
+	json_get_var mobile_priority mobile_priority
+	json_get_var module_section module_section
+	json_get_var module_first module_first
+	json_get_var SIMX SIMX
+	json_get_var switch_sim_enabled switch_sim_enabled
+	json_get_var auth_apn auth_apn
+
+	auth_apn="$((auth_apn ^ 0))"
+	if [ "$mobile_priority" != 1 ];then
+		mobile_priority=0
+	fi
+
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ -f /etc/config/netcard_db ];then
+	#多模块设置
+		module_section_list="$(uci show network | sed -n 's/network.\(4gwan[0-9]*\)\+=interface/\1/p' | sort)"
+		if [ -z "$module_section" ];then
+			module_section="$(echo "$module_section_list" | sed -n 1p)"
+		fi
+		module_section_judge="$(echo "$module_section_list" | grep -w "$module_section")"
+		#判断要修改的module_section是否存在
+		if [ -z "$module_section_judge" ];then
+			json_init
+			json_add_string code "2"
+			json_add_string reason	"module_section_judge is empty"
+			echo -n "$(json_dump)"
+			return
+		fi
+
+		busnum="$(my_uci_get network.${module_section}.busnum)"
+		if [ -n "$busnum" ];then
+			gpio_default_value="$(uci -q show netcard_db.bus${busnum} | sed -n 's/netcard_db.*value\([01]\)_sim='\'$SIMX\''/\1/p')"
+			if [ -n "$gpio_default_value" ];then
+				uci set netcard_db.bus${busnum}.gpio_default_value="$gpio_default_value"
+				if [ "$gpio_default_value" = 0 ];then
+					uci set netcard_db.bus${busnum}.apn0="$apn"
+					uci set netcard_db.bus${busnum}.pin0="$pin"
+					uci set netcard_db.bus${busnum}.dialnumber0="$dialnumber"
+					uci set netcard_db.bus${busnum}.username0="$username"
+					uci set netcard_db.bus${busnum}.password0="$password"
+				elif [ "$gpio_default_value" = 1 ];then
+					uci set netcard_db.bus${busnum}.apn1="$apn"
+					uci set netcard_db.bus${busnum}.pin1="$pin"
+					uci set netcard_db.bus${busnum}.dialnumber1="$dialnumber"
+					uci set netcard_db.bus${busnum}.username1="$username"
+					uci set netcard_db.bus${busnum}.password1="$password"
+				fi
+			fi
+			uci set netcard_db.bus${busnum}.switch_sim_enabled="$switch_sim_enabled"
+			uci commit netcard_db
+		fi
+
+	else
+	#单模块设置
+		module_section="4gwan"
+		gpio_default_value="$(uci -q show netcard.device | sed -n 's/netcard.*value\([01]\)_sim='\'$SIMX\''/\1/p')"
+		if [ -n "$gpio_default_value" ];then
+			uci set netcard.device.gpio_default_value="$gpio_default_value"
+			if [ "$gpio_default_value" = 0 ];then
+				uci set netcard.device.apn0="$apn"
+				uci set netcard.device.pin0="$pin"
+				uci set netcard.device.dialnumber0="$dialnumber"
+				uci set netcard.device.username0="$username"
+				uci set netcard.device.password0="$password"
+			elif [ "$gpio_default_value" = 1 ];then
+				uci set netcard.device.apn1="$apn"
+				uci set netcard.device.pin1="$pin"
+				uci set netcard.device.dialnumber1="$dialnumber"
+				uci set netcard.device.username1="$username"
+				uci set netcard.device.password1="$password"
+			fi
+		fi
+		uci set netcard.device.switch_sim_enabled="$switch_sim_enabled"
+		uci set netcard.device.auth_apn="$auth_apn"
+		uci commit netcard
+	fi
+
+	uci set network.${module_section}.apn="$apn"
+	uci set network.${module_section}.pin="$pin"
+	uci set network.${module_section}.dialnumber="$dialnumber"
+	uci set network.${module_section}.username="$username"
+	uci set network.${module_section}.password="$password"
+	uci commit network
+
+	uci set anyos_netwatchdog.device.mobile_priority="$mobile_priority"
+	uci set anyos_netwatchdog.device.module_first="$module_first"
+	uci commit anyos_netwatchdog
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set 4g config success"
+	echo -n "$(json_dump)"
+
+	ifdown "$module_section" &
+	/usr/sbin/anywifi/start_4g_entry.sh &
+}
+
+set_4g_sim(){
+	username="$FORM_username"
+	password="$FORM_password"
+	gpio_default_value="$FORM_gpio_default_value"
+	gpio_default_value="$((gpio_default_value ^ 0))"
+	if [ "$gpio_default_value" != 0 ];then
+		gpio_default_value=1
+	fi
+	(passchk "$username" "$password")
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-4"
+		json_add_string reason "check passwork fail: username or password invalid"
+		echo -n "$(json_dump)"
+		return
+	fi
+	sim_switch_gpio="$(my_uci_get netcard.device.sim_switch_gpio)"
+	if [ -z "$sim_switch_gpio" ]; then
+		json_init
+		json_add_string code "-6"
+		json_add_string reason "the board no have sim_switch_gpio"
+		echo -n "$(json_dump)"
+		return
+	fi
+	uci set netcard.device.gpio_default_value="$gpio_default_value"
+	uci commit netcard
+	if [ -e "/etc/config/netcard" ] && [ -n "$gpio_default_value" ];then
+		if [ ! -e /sys/class/gpio/gpio$sim_switch_gpio ];then
+			echo "$sim_switch_gpio" > /sys/class/gpio/export
+			echo "out" > /sys/class/gpio/gpio$sim_switch_gpio/direction
+		fi
+		echo "$gpio_default_value" > /sys/class/gpio/gpio$sim_switch_gpio/value
+	fi
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set 4g sim success"
+	echo -n "$(json_dump)"
+
+	module_section="4gwan"
+	ifdown "$module_section" &
+	/usr/sbin/anywifi/start_4g_entry.sh &
+}
+
+network_provider(){
+
+	network_provider="$1"
+
+	case $network_provider in
+	46001)
+		network_provider="China Unicom (46001)"
+	;;
+	46006)
+		network_provider="China Unicom (46006)"
+	;;
+	46000)
+		network_provider="China Mobile (46000)"
+	;;
+	46002)
+		network_provider="China Mobile (46002)"
+	;;
+	46007)
+		network_provider="China Mobile (46007)"
+	;;
+	46020)
+		network_provider="China Mobile (46020)"
+	;;
+	46003)
+		network_provider="China Telecom (46003)"
+	;;
+	46005)
+		network_provider="China Telecom (46005)"
+	;;
+	46011)
+		network_provider="China Telecom (46011)"
+	;;
+	esac
+	echo -n "$network_provider"
+}
+
+get_module_signal(){
+	module_section_list="$(uci show network | sed -n 's/network.\(4gwan[0-9]*\)\+=interface/\1/p' | sort)"
+	if [ -z "$module_section_list" ];then
+		json_init
+		json_add_string code "-4"
+		json_add_string reason "there is no 4g interface"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	module_section="$FORM_module_section"
+	if [ -z "$module_section" ];then
+		module_section="$(echo "$module_section_list" | sed -n 1p)"
+	fi
+	info_number="${module_section:5}"
+
+	if [ -f "/tmp/4ginfo${info_number}" ];then
+		model_date="$(cat /tmp/4ginfo${info_number})"
+	else
+		json_init
+		json_add_string code "4"
+		json_add_string reason "get module signal fail"
+		json_add_array "data"
+		json_add_object
+		json_add_string operator "NOT HAVE"
+		json_add_string model "NO Model"
+		json_add_string imei "0"
+		json_add_string iccid "NO SIM"
+		json_add_string signal "0"
+		json_add_string module_sim "NOT SITE"
+		json_close_object
+		json_close_array
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ ! -f /etc/config/netcard_db ];then
+	#单模块获取
+		operator="$(echo "$model_date" | grep cops | awk -F '"' '{print $4}')"
+		operator="$(network_provider "$operator")"
+
+		model="$(echo "$model_date" | grep device_model | awk -F '"' '{print $4}')"
+		imei="$(echo "$model_date" | grep imei | awk -F '"' '{print $4}')"
+		signal="$(echo "$model_date" | grep signal | awk -F '"' '{print $4}')"
+		iccid="$(echo "$model_date" | grep iccid | awk -F '"' '{print $4}')"
+		[ "$iccid" == "00000000000000000000" ] && iccid="NO SIM"
+		module_sim="NOT SITE"
+	else
+		#多模块获取
+		if [ -n "$model_date" ];then
+			json_load "$model_date"
+			json_get_var operator cops
+			json_get_var model device_model
+			json_get_var imei imei
+			json_get_var signal signal
+			json_get_var iccid iccid
+			json_get_var module_sim name
+		fi
+		operator="$(network_provider "$operator")"
+		[ "$iccid" == "00000000000000000000" ] && iccid="NO SIM"
+	fi
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get module signal success"
+	json_add_array "data"
+	json_add_object
+	json_add_string operator "$operator"
+	json_add_string model "$model"
+	json_add_string imei "$imei"
+	json_add_string iccid "$iccid"
+	json_add_string signal "$signal"
+	json_add_string module_sim "$module_sim"
+	json_close_object
+	json_close_array
+
+	echo -n "$(json_dump)"
+}
+
+get_module_status(){
+	module_section_list="$(uci show network | sed -n 's/network.\(4gwan[0-9]*\)\+=interface/\1/p' | sort)"
+	if [ -z "$module_section_list" ];then
+		json_init
+		json_add_string code "-4"
+		json_add_string reason "there is no 4g interface"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	module_section="$FORM_module_section"
+	if [ -z "$module_section" ];then
+		module_section="$(echo "$module_section_list" | sed -n 1p)"
+	fi
+
+	module_proto="$(my_uci_get network.${module_section}.proto)"
+
+	#根据模块拨号模式 确定ifconfig 时的module_section
+	if [ "$module_proto" == "3g" ];then
+		module_interface="3g-${module_section}"
+	else
+		module_ifname="$(my_uci_get network.${module_section}.ifname)"
+		module_interface="$module_ifname"
+	fi
+	[ -z "$module_interface" ] && module_interface="NONE"
+	module_ubus_data="$(ubus call network.interface.${module_section} status)"
+	json_load "$module_ubus_data"
+	json_get_var uptime uptime
+	trafic_tmp="$(ifconfig "$module_interface" 2>/dev/nul)"
+	host="$(ifconfig "$module_interface" | grep "inet addr:" | awk -F ":" '{print $2}' | awk '{print $1}')"
+	g4_ipaddr6="$(ifconfig "$module_ifname" | grep "inet6 addr:" | awk -F "addr:" '{print $2}' | awk '{print $1}')"
+	macaddr="$(ifconfig "$module_interface" | awk '/HWaddr/{print $5}')"
+	rxall="$(echo "$trafic_tmp" | awk '/RX bytes:/{print $2}' | tr -cd "[0-9]")"
+	txall="$(echo "$trafic_tmp" | awk '/RX bytes:/{print $6}' | tr -cd "[0-9]")"
+
+	[ -z "$host" ] && host=0.0.0.0
+	[ -z "$uptime" ] && uptime=0
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get module status success"
+	json_add_array "data"
+	json_add_object
+	json_add_string ifname "$module_interface"
+	json_add_string host "$host"
+	json_add_string macaddr "$macaddr"
+	json_add_string txall "$txall"
+	json_add_string rxall "$rxall"
+	json_add_string uptime "$uptime"
+        json_add_array "ipv6"
+	for value in $g4_ipaddr6
+        do
+                json_add_string addr "$value"
+        done
+	json_close_array  
+	json_close_object
+	json_close_array
+	echo -n "$(json_dump)"
+}
+
+get_4g_log(){
+	module_section_list="$(uci show network | sed -n 's/network.\(4gwan[0-9]*\)\+=interface/\1/p' | sort)"
+	if [ -z "$module_section_list" ];then
+		model_date="NOT HAVE LOG"
+	fi
+
+	module_section="$FORM_module_section"
+	if [ -z "$module_section" ];then
+		module_section="$(echo "$module_section_list" | sed -n 1p)"
+	fi
+
+	info_number="${module_section:5}"
+
+	if [ -f "/tmp/4ginfo${info_number}" ];then
+		model_date="$(cat /tmp/4ginfo${info_number})"
+	else
+		model_date="NOT HAVE LOG"
+	fi
+
+	if [ -f /etc/config/netcard_db ];then
+		content="$(echo "$model_date" | tr -d "[{}]" | tr ',' '\n')"
+	else
+		content="$(echo "$model_date" | grep -v "{\|}")"
+	fi
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get 4g log success"
+	json_add_string content "$content"
+	echo -n "$(json_dump)"
+}
+
+getWiFi2(){
+	#wlan0 is master and wlan1 is guest network
+	wifi_device="$(my_uci_get anyos.wifi.wifi2_device)"
+	wifi_iface=default_radio0
+	disabled="$(my_uci_get wireless.${wifi_device}.disabled)"
+	wifi_ifname="$(my_uci_get wireless.${wifi_iface}.ifname)"
+	if [ "$disabled" != "1" ];then
+		enabled="1"
+	else
+		enabled="0"
+	fi
+	country="$(my_uci_get wireless.${wifi_device}.country)"
+
+	channel="$(my_uci_get wireless.${wifi_device}.channel)"
+	if [ "$channel" == "undefined" ];then
+		channel=0
+	fi
+	bw="$(my_uci_get wireless.${wifi_device}.bw)"
+	if [ "$bw" != "1" ];then
+		htmode=ht20
+	else
+		htmode=ht40
+	fi
+
+	threshold="$(my_uci_get wireless.${wifi_device}.fragthres)"
+	[ -z "$threshold" ] && threshold="2346"
+
+	rts_threshold="$(my_uci_get wireless.${wifi_device}.rtsthres)"
+	[ -z "$rts_threshold" ] && rts_threshold="2347"
+
+	wmm="$(my_uci_get wireless.${wifi_device}.wmm)"
+	[ -z "$wmm" ] && wmm="1"
+
+	isolated="$(my_uci_get wireless.${wifi_device}.noforward)"
+
+	hidden="$(my_uci_get wireless.${wifi_iface}.hidden)"
+	if [ "$hidden" != "1" ];then
+		hidden="0"
+	fi
+
+	bssid="$(my_uci_get wireless.${wifi_iface}.macaddr)"
+	if [ "$bssid" == "" ];then
+		bssid="$(cat /sys/class/net/${wifi_ifname}/address)"
+	fi
+	ApCliEnable="$(my_uci_get wireless.default_radio0.ApCliEnable)"
+	ApCliEnable="$((ApCliEnable ^ 0))"
+
+	macfilter="$(wificonf -f /etc/wireless/${wifi_device}/${wifi_device}.dat get AccessPolicy0)"
+	# 0/disable as disable , 1/allow as whitelist , 2/deny  as blacklist
+	if [ $macfilter == "0" ] || [ -z $macfilter ];then
+		macfilter="disable"
+	elif [ "$macfilter" == "1" ];then
+		macfilter="allow"
+	else
+		macfilter="deny"
+	fi
+	maclist="$(wificonf -f /etc/wireless/${wifi_device}/${wifi_device}.dat get AccessControlList0 | tr ';' ' ')"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "getWiFi2 success"
+
+	json_add_string enabled "$enabled"
+	json_add_string country "$country"
+	json_add_string channel "$channel"
+	json_add_string htmode "$htmode"
+	json_add_string threshold "$threshold"
+	json_add_string rts_threshold "$rts_threshold"
+	json_add_string wmm "$wmm"
+	json_add_string isolated "$isolated"
+	json_add_string bssid "$bssid"
+	json_add_string ssid "$(my_uci_get wireless.${wifi_iface}.ssid)"
+	json_add_string hidden "$hidden"
+	json_add_string encryption "$(my_uci_get wireless.${wifi_iface}.encryption)"
+	json_add_string key "$(my_uci_get wireless.${wifi_iface}.key)"
+	json_add_string macfilter "$macfilter"
+	json_add_string ApCliEnable "$ApCliEnable"
+	json_add_array "maclist"
+	for mymac in $maclist;do
+		json_add_string mac $mymac
+	done
+	json_close_array
+
+	echo -n "$(json_dump)"
+}
+
+search_ctcode_and_channals(){
+	body="$FORM_body"
+	json_load    "$body"
+	json_get_var country country
+	json_get_var wifi_type wifi_type
+	[ -n "$wifi_type" ] || wifi_type="24G"
+
+	if [ "$wifi_type" = "24G" ];then
+		wifi_device="$(my_uci_get anyos.wifi.wifi2_device)"
+	else
+		wifi_type="5G"
+		wifi_device="$(my_uci_get anyos.wifi.wifi5_device)"
+	fi
+
+	[ -n "$country" ] || country="$(my_uci_get wireless.${wifi_device}.country)"
+	[ -n "$country" ] || country="CN"
+
+	channel="$(my_uci_get wireless.${wifi_device}.channel)"
+	if [ "$channel" == "undefined" ];then
+		channel=0
+	fi
+
+	country_list="$(ctcode_to_channals -l)"
+	channel_list="$(ctcode_to_channals -c ${country} ${wifi_type})"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "search_ctcode_and_channals success"
+	json_add_string country "$country"
+	json_add_string channel "$channel"
+	json_add_array "country_list"
+	for country_tmp in $country_list;do
+	json_add_string country_tmp $country_tmp
+	done
+	json_close_array
+	json_add_array "channel_list"
+	for channel_tmp in $channel_list;do
+	json_add_string channel_tmp $channel_tmp
+	done
+	json_close_array
+
+	echo -n "$(json_dump)"
+}
+
+#{"access_token":"", "enabled":"1/0", "channel":"1-13", "ssid":"wifi_name", "bandwidth":"ht20/ht40", "encryption":"none/psk/xxx", "key":"12344",
+#"bssid":"11:22:33:44:55:66", "isolated":"1/0", "macfilter":"disable/allow/deny", "maclist":"[xxx,xxx]","rts_threshold":"1~2347","threshold":"256~2346",wmm:"1/0"}
+setWiFi2_nocommit(){
+	wifi_device="$(my_uci_get anyos.wifi.wifi2_device)"
+	wifi_iface=default_radio0
+	wifi_ifname="$(my_uci_get anyos.wifi.wifi2_ifname | awk '{print $1}')"
+
+	body="$FORM_body"
+	json_load    "$body"
+	json_get_var enabled enabled
+	json_get_var channel channel
+	json_get_var htmode htmode
+	json_get_var hidden hidden
+	json_get_var isolated isolated
+	json_get_var rts_threshold rts_threshold
+	json_get_var threshold threshold
+	json_get_var macfilter macfilter
+	json_get_var wmm wmm
+	json_get_var country country
+
+	json_get_var ssid ssid
+	json_get_var encryption encryption
+	json_get_var key key
+
+	if  [ -z $ssid ];then
+		json_init
+		json_add_string code "-4"
+		json_add_string reason "Missing ssid parameters"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ -z "$country" ];then
+		country="CN"
+	fi
+	if [ "$country" == "CN" ];then
+		autoch_skip="12;13;"
+	else
+		autoch_skip=" "
+	fi
+	region="$(ctcode_to_channals -r ${country} 24G)"
+
+	[ -z "$encryption" ] && encryption="none"
+
+	if [ -z $key ] && [ "$encryption" != "none" ];then
+		json_init
+		json_add_string code "-5"
+		json_add_string reason "Missing key parameters"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ "$enabled" == "0" ];then
+		disabled="1"
+	else
+		disabled="0"
+	fi
+
+	[ -z "channel" ] && channel=0
+
+	if [ "$htmode" == "ht40" ];then
+		bw=1
+	else
+		bw=0
+	fi
+
+	[ -z "$hidden" ] && hidden=0
+	if [ "$channel" == "undefined" ];then
+		channel=0
+	fi
+
+	[ -z "isolated" ] && isolated=0
+	[ -z "rts_threshold" ] && rts_threshold=2347
+	[ -z "threshold" ] && threshold=2346
+	[ -z "wmm" ] && wmm=1
+
+	if [ "$threshold" -gt "2346" ] || [ "$threshold" -lt "256" ] || [ "$rts_threshold" -gt "2347" ] || [ "$rts_threshold" -lt "1" ];then
+		json_init
+		json_add_string code "-6"
+		json_add_string reason "setting frag or rts err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	uci set wireless.${wifi_device}.country="$country"
+	uci set wireless.${wifi_device}.region="$region"
+	uci set wireless.${wifi_device}.channel="$channel"
+	uci set wireless.${wifi_device}.bw="$bw"
+	uci set wireless.${wifi_device}.fragthres="$threshold"
+	uci set wireless.${wifi_device}.rtsthres="$rts_threshold"
+	uci set wireless.${wifi_device}.disabled="$disabled"
+	uci set wireless.${wifi_device}.noforward="$isolated"
+	uci set wireless.${wifi_device}.wmm="$wmm"
+	uci set wireless.${wifi_device}.autoch_skip="$autoch_skip"
+
+	uci set wireless.${wifi_iface}.ssid="$ssid"
+	uci set wireless.${wifi_iface}.hidden="$hidden"
+	uci set wireless.${wifi_iface}.encryption="$encryption"
+	uci set wireless.${wifi_iface}.key="$key"
+
+	if [ -z "$macfilter" ] || [ "$macfilter" == "disable" ] ; then
+		macfilter="0"
+	elif [ "$macfilter" == "allow" ] ; then
+		macfilter="1"
+	elif [ "$macfilter" == "deny" ] ; then
+		macfilter="2"
+	fi
+
+	cp /rom/etc/wireless/${wifi_device}/${wifi_device}.dat /etc/wireless/${wifi_device}/${wifi_device}.dat
+	uci set wireless.${wifi_device}.AccessPolicy0="$macfilter"
+	json_select maclist
+	index=1
+	macline=""
+	while [ 1 ];do
+		json_get_var macaddr "${index}"
+		if [ -z "$macaddr" ];then
+			break
+		else
+			index="$((index+1))"
+		fi
+
+		if [ -z "$macline" ];then
+			macline="$macaddr"
+		else
+			macline="${macline};${macaddr}"
+		fi
+	done
+
+	uci set wireless.${wifi_device}.AccessControlList0="$macline"
+	uci commit wireless
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set wifi2 success"
+
+	echo -n "$(json_dump)"
+	if [ -f "/usr/sbin/anywifi/anyos/uplink_interface" ];then
+		. /usr/sbin/anywifi/anyos/uplink_interface
+		status
+	fi
+}
+
+setWiFi2(){
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	setWiFi2_nocommit
+	(/etc/init.d/network restart) &
+}
+
+get_wifi_guest(){
+	ssid="$(my_uci_get wireless.guest_wifi.ssid)"
+	disabled="$(my_uci_get wireless.guest_wifi.disabled)"
+
+	if [ "$disabled" != "1" ];then
+		enabled="1"
+	else
+		enabled="0"
+	fi
+
+	json_init
+	json_add_string code "1"
+	json_add_string guest_enabled "$enabled"
+	json_add_string guest_ssid "$ssid"
+	json_add_string reason "get wifi guest success"
+
+	echo -n "$(json_dump)"
+}
+
+set_wifi_guest(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	guest_ssid="$FORM_guest_ssid"
+	guest_enabled="$FORM_guest_enabled"
+	if [ -z $guest_ssid ];then
+		json_init
+		json_add_string code "-4"
+		json_add_string reason "missing ssid"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ "$guest_enabled" == "0" ];then
+		disabled="1"
+	else
+		disabled="0"
+	fi
+
+	uci set wireless.guest_wifi.disabled="$disabled"
+	uci set wireless.guest_wifi.ssid="$guest_ssid"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set wifi_guest success"
+	json_add_string guest_ssid "$guest_ssid"
+	json_add_string guest_enabled "$guest_enabled"
+	echo -n "$(json_dump)"
+
+	uci commit wireless
+	wifi &
+}
+
+getWiFi5(){
+	wifi_device="$(my_uci_get anyos.wifi.wifi5_device)"
+	wifi_iface=default_radio1
+	disabled="$(my_uci_get wireless.${wifi_device}.disabled)"
+	wifi_ifname="$(my_uci_get wireless.${wifi_iface}.ifname)"
+	if [ "$disabled" != "1" ];then
+		enabled="1"
+	else
+		enabled="0"
+	fi
+
+	country="$(my_uci_get wireless.${wifi_device}.country)"
+	if [ -z "$country" ];then
+		country="CN"
+	fi
+
+	channel="$(my_uci_get wireless.${wifi_device}.channel)"
+	if [ "$channel" == "undefined" ];then
+		channel=0
+	fi
+	bw="$(my_uci_get wireless.${wifi_device}.bw)"
+	if [ "$bw" == "0" ];then
+		htmode=ht20
+	elif [ "$bw" == "1" ];then
+		htmode=ht40
+	elif [ "$bw" == "2" ];then
+		htmode=ht80
+	fi
+
+	threshold="$(my_uci_get wireless.${wifi_device}.fragthres)"
+	[ -z "$threshold" ] && threshold="2346"
+
+	rts_threshold="$(my_uci_get wireless.${wifi_device}.rtsthres)"
+	[ -z "$rts_threshold" ] && rts_threshold="2347"
+
+	wmm="$(my_uci_get wireless.${wifi_device}.wmm)"
+	[ -z "$wmm" ] && wmm="1"
+
+	isolated="$(my_uci_get wireless.${wifi_device}.noforward)"
+
+	hidden="$(my_uci_get wireless.${wifi_iface}.hidden)"
+	if [ "$hidden" != "1" ];then
+		hidden="0"
+	fi
+
+	bssid="$(my_uci_get wireless.${wifi_iface}.macaddr)"
+	if [ "$bssid" == "" ];then
+		bssid="$(cat /sys/class/net/${wifi_ifname}/address)"
+	fi
+
+	macfilter="$(wificonf -f /etc/wireless/${wifi_device}/${wifi_device}.dat get AccessPolicy0)"
+	# 0/disable as disable , 1/allow as whitelist , 2/deny  as blacklist
+	if [ $macfilter == "0" ] || [ -z $macfilter ];then
+		macfilter="disable"
+	elif [ "$macfilter" == "1" ];then
+		macfilter="allow"
+	else
+		macfilter="deny"
+	fi
+	maclist="$(wificonf -f /etc/wireless/${wifi_device}/${wifi_device}.dat get AccessControlList0 | tr ';' ' ')"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "getWiFi5 success"
+
+	json_add_string enabled "$enabled"
+	json_add_string country "$country"
+	json_add_string channel "$channel"
+	json_add_string htmode "$htmode"
+	json_add_string threshold "$threshold"
+	json_add_string rts_threshold "$rts_threshold"
+	json_add_string wmm "$wmm"
+	json_add_string isolated "$isolated"
+	json_add_string bssid "$bssid"
+	json_add_string ssid "$(my_uci_get wireless.${wifi_iface}.ssid)"
+	json_add_string hidden "$hidden"
+	json_add_string encryption "$(my_uci_get wireless.${wifi_iface}.encryption)"
+	json_add_string key "$(my_uci_get wireless.${wifi_iface}.key)"
+	json_add_string macfilter "$macfilter"
+	json_add_array "maclist"
+	for mymac in $maclist;do
+		json_add_string mac $mymac
+	done
+	json_close_array
+
+	echo -n "$(json_dump)"
+}
+
+setWiFi5_nocommit(){
+	wifi_device="$(my_uci_get anyos.wifi.wifi5_device)"
+	wifi_iface=default_radio1
+	wifi_ifname="$(my_uci_get anyos.wifi.wifi2_ifname | awk '{print $1}')"
+
+	body="$FORM_body"
+	json_load    "$body"
+	json_get_var enabled enabled
+	json_get_var channel channel
+	json_get_var htmode htmode
+	json_get_var hidden hidden
+	json_get_var isolated isolated
+	json_get_var rts_threshold rts_threshold
+	json_get_var threshold threshold
+	json_get_var macfilter macfilter
+	json_get_var wmm wmm
+	json_get_var country country
+
+	json_get_var ssid ssid
+	json_get_var encryption encryption
+	json_get_var key key
+
+	if  [ -z $ssid ];then
+		json_init
+		json_add_string code "-4"
+		json_add_string reason "Missing ssid parameters"
+		echo -n "$(json_dump)"
+		return
+	fi
+	[ -z "$country" ] && country="CN"
+	if [ "$country" == "US" ];then
+		RDRegion=FCC
+	elif [ "$country" == "CN" ];then
+		RDRegion=CHN
+	elif [ "$country" == "JP" ];then
+		RDRegion=JAP
+	else
+		RDRegion=CE
+	fi
+	aregion="$(ctcode_to_channals -r ${country} 5G)"
+
+	[ -z "channel" ] && channel=0
+	if [ "$channel" == "undefined" ];then
+		channel=0
+	fi
+	[ -z "$encryption" ] && encryption="none"
+
+	if [ -z $key ] && [ "$encryption" != "none" ];then
+		json_init
+		json_add_string code "-5"
+		json_add_string reason "Missing key parameters"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ "$enabled" == "0" ];then
+		disabled="1"
+	else
+		disabled="0"
+	fi
+
+	if [ "$htmode" == "ht20" -o "$htmode" == "" ];then
+		bw=0
+	elif [ "$htmode" == "ht40" ];then
+		bw=1
+	elif [ "$htmode" == "ht80" ];then
+		bw=2
+	fi
+	[ -z "isolated" ] && isolated=0
+	[ -z "rts_threshold" ] && rts_threshold=2347
+	[ -z "threshold" ] && threshold=2346
+	[ -z "wmm" ] && wmm=1
+	if [ "$threshold" -gt "2346" ] || [ "$threshold" -lt "256" ] || [ "$rts_threshold" -gt "2347" ] || [ "$rts_threshold" -lt "1" ];then
+		json_init
+		json_add_string code "-6"
+		json_add_string reason "setting frag or rts err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	[ -z "$hidden" ] && hidden=0
+
+	uci set wireless.${wifi_device}.country="$country"
+	uci set wireless.${wifi_device}.aregion="$aregion"
+	uci set wireless.${wifi_device}.channel="$channel"
+	uci set wireless.${wifi_device}.bw="$bw"
+	uci set wireless.${wifi_device}.fragthres="$threshold"
+	uci set wireless.${wifi_device}.rtsthres="$rts_threshold"
+	uci set wireless.${wifi_device}.disabled="$disabled"
+	uci set wireless.${wifi_device}.noforward="$isolated"
+	uci set wireless.${wifi_device}.wmm="$wmm"
+
+	uci set wireless.${wifi_iface}.ssid="$ssid"
+	uci set wireless.${wifi_iface}.hidden="$hidden"
+	uci set wireless.${wifi_iface}.encryption="$encryption"
+	uci set wireless.${wifi_iface}.key="$key"
+
+	if [ -z "$macfilter" ] || [ "$macfilter" == "disable" ] ; then
+		macfilter="0"
+	elif [ "$macfilter" == "allow" ] ; then
+		macfilter="1"
+	elif [ "$macfilter" == "deny" ] ; then
+		macfilter="2"
+	fi
+
+	cp /rom/etc/wireless/${wifi_device}/${wifi_device}.dat /etc/wireless/${wifi_device}/${wifi_device}.dat
+	wificonf -f /etc/wireless/${wifi_device}/${wifi_device}.dat set AccessPolicy0 "$macfilter"
+	json_select maclist
+	index=1
+	macline=""
+	while [ 1 ];do
+		json_get_var macaddr "${index}"
+		if [ -z "$macaddr" ];then
+			break
+		else
+			index="$((index+1))"
+		fi
+
+		if [ -z "$macline" ];then
+			macline="$macaddr"
+		else
+			macline="${macline};${macaddr}"
+		fi
+	done
+
+	wificonf -f /etc/wireless/${wifi_device}/${wifi_device}.dat set AccessControlList0 "$macline"
+	wificonf -f /etc/wireless/${wifi_device}/${wifi_device}.dat set RDRegion "$RDRegion"
+
+	uci commit wireless
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set wifi5 success"
+
+	echo -n "$(json_dump)"
+	if [ -f "/usr/sbin/anywifi/anyos/uplink_interface" ];then
+		. /usr/sbin/anywifi/anyos/uplink_interface
+		status
+	fi
+}
+
+setWiFi5(){
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	setWiFi5_nocommit
+	(wifi) &
+}
+
+get_wifi_guest5(){
+	ssid="$(my_uci_get wireless.guest_wifi1.ssid)"
+	disabled="$(my_uci_get wireless.guest_wifi1.disabled)"
+
+	if [ "$disabled" != "1" ];then
+		enabled="1"
+	else
+		enabled="0"
+	fi
+
+	json_init
+	json_add_string code "1"
+	json_add_string guest_enabled "$enabled"
+	json_add_string guest_ssid "$ssid"
+	json_add_string reason "get wifi guest success"
+
+	echo -n "$(json_dump)"
+}
+
+set_wifi_guest5(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	guest_ssid="$FORM_guest_ssid"
+	guest_enabled="$FORM_guest_enabled"
+	if [ -z $guest_ssid ];then
+		json_init
+		json_add_string code "-4"
+		json_add_string reason "missing ssid"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ "$guest_enabled" == "0" ];then
+		disabled="1"
+	else
+		disabled="0"
+	fi
+
+	uci set wireless.guest_wifi1.disabled="$disabled"
+	uci set wireless.guest_wifi1.ssid="$guest_ssid"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set wifi_guest success"
+	json_add_string guest_ssid "$guest_ssid"
+	json_add_string guest_enabled "$guest_enabled"
+	echo -n "$(json_dump)"
+
+	uci commit wireless
+	wifi &
+}
+
+#根据板子实际功率
+get_wifi_power(){
+	wifi_device="$(my_uci_get anyos.wifi.wifi2_device)"
+	power="$(my_uci_get wireless.${wifi_device}.txpower)"
+	if [ "$power" == "100" ]; then
+		power="high"
+	elif [[ "$power" == "75" ]] ;then
+		power="medium"
+	else
+		power="low"
+	fi
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get wifi power success"
+	json_add_string wifi_power "$power"
+
+	echo -n "$(json_dump)"
+}
+
+set_wifi_power(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	wifi_device0="$(my_uci_get anyos.wifi.wifi2_device)"
+	if [ "$FORM_wifi_power" == "high" ];then
+		uci set wireless.${wifi_device0}.txpower=100
+	elif [ "$FORM_wifi_power" == "medium" ]; then
+		uci set wireless.${wifi_device0}.txpower=75
+	elif [ "$FORM_wifi_power" == "low" ]; then
+		uci set wireless.${wifi_device0}.txpower=50
+	else
+		uci set wireless.${wifi_device0}.txpower=100
+	fi
+
+	wifi_device1="$(my_uci_get anyos.wifi.wifi5_device)"
+	if [ ! -z "$wifi_device1" ];then
+		if [ "$FORM_wifi_power" == "high" ];then
+			uci set wireless.${wifi_device1}.txpower=100
+		elif [ "$FORM_wifi_power" == "medium" ]; then
+			uci set wireless.${wifi_device1}.txpower=75
+		elif [ "$FORM_wifi_power" == "low" ]; then
+			uci set wireless.${wifi_device1}.txpower=50
+		else
+			uci set wireless.${wifi_device1}.txpower=100
+		fi
+	fi
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set wifi power success"
+
+	echo -n "$(json_dump)"
+	uci commit wireless
+	wifi &
+}
+
+get_wifi_apclient_config(){
+	enabled="$(my_uci_get wireless.default_radio0.ApCliEnable)"
+	enabled="$((enabled ^ 0))"
+	ssid="$(my_uci_get wireless.default_radio0.ApCliSsid)"
+	bssid="$(my_uci_get wireless.default_radio0.ApCliBssid)"
+	ApCliAuthMode="$(my_uci_get wireless.default_radio0.ApCliAuthMode)"
+	ApCliEncrypType="$(my_uci_get wireless.default_radio0.ApCliEncrypType)"
+	encryption="${ApCliAuthMode} ${ApCliEncrypType}"
+	[ "$encryption" == "OPEN NONE" ] && encryption="NONE"
+	key="$(my_uci_get wireless.default_radio0.ApCliWPAPSK)"
+
+	wifi_device="$(my_uci_get anyos.wifi.wifi2_device)"
+	channel="$(my_uci_get wireless.${wifi_device}.channel)"
+	if [ "$channel" == "undefined" ];then
+		channel=0
+	fi
+	
+	json_init
+	json_add_string code "1"
+	json_add_string enabled "$enabled"
+	json_add_string ssid "$ssid"
+	json_add_string bssid "$bssid"
+	json_add_string encryption "$encryption"
+	json_add_string key "$key"
+	json_add_string channel "$channel"
+	
+	echo -n "$(json_dump)"
+}
+
+get_wifi_apclient_status(){
+	ssid="$(iwconfig apcli0 | awk -F 'ESSID:' '/ESSID:/{print $2}' | tr -d '"')"
+	bssid="$(iwconfig apcli0 | awk '/Access Point:/{print $0}' | grep -Eoi "((([a-f0-9]{2}:){5})|(([a-f0-9]{2}-){5}))[a-f0-9]{2}")"
+	apclient_ip="$(ifconfig apcli0 | grep "inet addr" | awk -F ':' '{print $2}' | awk '{print $1}')"
+
+	apclient_ubus_data="$(ubus call network.interface.wwan status)"
+	json_load "$apclient_ubus_data"
+	json_get_var apclient_uptime uptime
+	if [ -n "$apclient_uptime" ];then
+		apclient_ifconfig="$(ifconfig br-lan)"
+		apclient_rx="$(echo "$apclient_ifconfig" | grep "RX bytes" | awk '{print $2}' | awk -F ':' '{print $2}')"
+		apclient_tx="$(echo "$apclient_ifconfig" | grep "RX bytes" | awk '{print $6}' | awk -F ':' '{print $2}')"
+	fi
+	json_init
+	json_add_string ssid "$ssid"
+	json_add_string bssid "$bssid"
+	json_add_string apclient_ip "$apclient_ip"
+	json_add_string apclient_rx "$apclient_rx"
+	json_add_string apclient_tx "$apclient_tx"
+	json_add_string apclient_uptime "$apclient_uptime"
+
+	echo -n "$(json_dump)"
+}
+
+set_wifi_apclient(){
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	body="$FORM_body"
+	json_load    "$body"
+
+	json_get_var enabled enabled
+	json_get_var ssid ssid
+	json_get_var bssid bssid
+	json_get_var encryption encryption
+	json_get_var key key
+	json_get_var channel channel
+
+	enabled="$((enabled ^ 0))"
+	[ -z "$encryption" ] && encryption="NONE"
+	[ "$encryption" == "OPEN NONE" ] && encryption="NONE"
+	if [ -n "$(echo "$encryption" | grep WPA2PSK)" ];then
+		ApCliAuthMode=WPA2PSK
+	elif [ -n  "$(echo "$encryption" | grep "WPAPSK\|WPA1PSK")" ];then
+		ApCliAuthMode=WPAPSK
+	else
+		ApCliAuthMode=OPEN
+	fi
+
+	if [ -n "$(echo "$encryption" | grep AES)" ];then
+		ApCliEncrypType=AES
+	elif [ -n  "$(echo "$encryption" | grep AES)" ];then
+		ApCliEncrypType=TKIP
+	else
+		ApCliEncrypType=NONE
+	fi
+
+	if [ -z $key ] && [ "$ApCliAuthMode" != "OPEN" ];then
+		json_init
+		json_add_string code "-5"
+		json_add_string reason "Missing key parameters"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ "$ApCliAuthMode" != "OPEN" -a "$(echo "$key" | wc -c)" -lt 9 ];then
+		json_init
+		json_add_string code "-6"
+		json_add_string reason "Key is less than 8 bits"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	uci set wireless.default_radio0.ApCliEnable="$enabled"
+	uci set wireless.default_radio0.ApCliSsid="$ssid"
+	uci set wireless.default_radio0.ApCliBssid="$bssid"
+	uci set wireless.default_radio0.ApCliAuthMode="$ApCliAuthMode"
+	uci set wireless.default_radio0.ApCliEncrypType="$ApCliEncrypType"
+	uci set wireless.default_radio0.ApCliWPAPSK="$key"
+
+	if [ -n "$channel" ] && [ "$channel" != "undefined" ];then
+		wifi_device="$(my_uci_get anyos.wifi.wifi2_device)"
+		uci set wireless.${wifi_device}.channel="$channel"
+	fi
+
+	uci commit wireless
+
+	json_init
+	json_add_string code "1"
+	json_add_string enabled "$enabled"
+	json_add_string channel "$channel"
+	json_add_string ssid "$ssid"
+	json_add_string bssid "$bssid"
+	json_add_string encryption "$ApCliAuthMode $ApCliEncrypType"
+	json_add_string key "$key"
+
+	echo -n "$(json_dump)"
+	(/etc/init.d/network restart) 1>/dev/null 2>&1 &
+}
+
+#firewall should set (config rule 'prohibit_wan_ping')
+get_fw_setting(){
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get fw setting success"
+
+	drop_invalid="$(my_uci_get firewall.@defaults[0].drop_invalid)"
+	disable_ipv6="$(my_uci_get firewall.@defaults[0].disable_ipv6)"
+	syn_flood="$(my_uci_get firewall.@defaults[0].syn_flood)"
+	accept_redirects="$(my_uci_get firewall.@defaults[0].accept_redirects)"
+
+	if [ -z "$drop_invalid" ];then
+		drop_invalid="0"
+	fi
+	if [ -z "$disable_ipv6" ];then
+		disable_ipv6="0"
+	fi
+	if [ -z "$syn_flood" ];then
+		syn_flood="0"
+	fi
+	if [ -z "$accept_redirects" ];then
+		accept_redirects="0"
+	fi
+
+	prohibit_wan_ping="$(my_uci_get firewall.@zone[1].input)"
+	if [ "$prohibit_wan_ping" == "ACCEPT" ];then
+		prohibit_wan_ping=1
+	else
+		prohibit_wan_ping=0
+	fi
+
+	json_add_object "data"
+	json_add_string drop_invalid "$drop_invalid"
+	json_add_string synflood_protect "$synflood_protect"
+	json_add_string disable_ipv6 "$disable_ipv6"
+	json_add_string syn_flood "$syn_flood"
+	json_add_string accept_redirects "$accept_redirects"
+	json_add_string prohibit_wan_ping "$prohibit_wan_ping"
+
+	json_close_object
+
+	echo -n "$(json_dump)"
+}
+
+set_fw_setting(){
+	body="$FORM_body"
+	access_token="$FORM_access_token"
+	json_load    $body
+	json_get_var drop_invalid drop_invalid
+	json_get_var disable_ipv6 disable_ipv6
+	json_get_var syn_flood syn_flood
+	json_get_var accept_redirects accept_redirects
+	json_get_var prohibit_wan_ping prohibit_wan_ping
+	json_get_var src src
+	json_get_var dest dest
+	json_get_var target target
+
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	uci set firewall.@defaults[0].drop_invalid="$drop_invalid"
+	uci set firewall.@defaults[0].disable_ipv6="$disable_ipv6"
+	uci set firewall.@defaults[0].syn_flood="$syn_flood"
+	uci set firewall.@defaults[0].synflood_protect="$syn_flood"
+	uci set firewall.@defaults[0].accept_redirects="$accept_redirects"
+
+	if [ "$prohibit_wan_ping" == "0" ];then
+		prohibit_wan_ping=REJECT
+	else
+		prohibit_wan_ping=ACCEPT
+	fi
+	uci set firewall.@zone[1].input="$prohibit_wan_ping"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set fw setting success"
+
+	echo -n "$(json_dump)"
+
+	uci commit firewall
+
+	(/etc/init.d/firewall restart) &
+}
+
+#firewall should set (config redirect 'DMZ')
+get_dmz(){
+	ipaddr="$(my_uci_get any_dmz.dmz.ipaddr)"
+	sport="$(my_uci_get any_dmz.dmz.sport)"
+	enabled="$(my_uci_get any_dmz.dmz.enabled)"
+	enabled="$((enabled ^ 0))"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get dmz success"
+	json_add_string ipaddr "$ipaddr"
+	json_add_string sport "$sport"
+	json_add_string enabled "$enabled"
+	echo -n "$(json_dump)"
+}
+
+set_dmz(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ -e /etc/firewall.anydmz ];then
+		json_load    "$FORM_body"
+		json_get_var ipaddr ipaddr
+		json_get_var sport sport
+		json_get_var enabled enabled
+		enabled="$((enabled ^ 0))"
+		echo "ipaddr $ipaddr sport $sport enabled $enabled"
+	else
+		ipaddr="$FORM_ipaddr"
+		sport="$FORM_sport"
+		enabled="$FORM_enabled"
+		enabled="$((enabled ^ 0))"
+	fi
+
+	section="$(uci show firewall | awk -F '.' '/firewall.anydmz/ {print $2}')"
+	if [ -z "$section" ];then
+		section="$(uci add firewall include)"
+		uci set firewall.${section}.path="/etc/firewall.anydmz"
+	fi
+	uci set firewall.${section}.enabled="$enabled"
+	uci commit firewall
+	if [ ! -e /etc/config/any_dmz ];then
+		touch /etc/config/any_dmz
+	fi
+	uci set any_dmz.dmz="info"
+	uci set any_dmz.dmz.ipaddr="$ipaddr"
+	uci set any_dmz.dmz.sport="$sport"
+	uci set any_dmz.dmz.enabled="$enabled"
+	uci commit any_dmz
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set dmz rule success"
+
+	echo -n "$(json_dump)"
+
+	uci commit firewall
+	(/etc/init.d/firewall restart) &
+}
+
+#netwatchdog
+get_netwatchdog(){
+	detect_host1="$(my_uci_get anyos_netwatchdog.device.detect_host1)"
+	detect_host2="$(my_uci_get anyos_netwatchdog.device.detect_host2)"
+	detect_itv="$(my_uci_get anyos_netwatchdog.device.detect_itv)"
+	action="$(my_uci_get anyos_netwatchdog.device.action)"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get anyos netwatchdog success"
+
+	json_add_object "data"
+
+	json_add_string detect_host1 "$detect_host1"
+	json_add_string detect_host2 "$detect_host2"
+	json_add_string detect_itv "$detect_itv"
+	json_add_string action "$action"
+
+	json_close_object
+	echo -n "$(json_dump)"
+}
+
+set_netwatchdog(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	detect_host1="$FORM_detect_host1"
+	detect_host2="$FORM_detect_host2"
+	detect_itv="$FORM_detect_itv"
+	action="$FORM_action"
+
+	if [ -z "$detect_host1" ];then
+		detect_host1="114.114.114.114"
+	fi
+
+	[ "$detect_itv" -ge 30 ] || detect_itv=30
+
+	if [ -z "$action" ];then
+		action="none"
+	fi
+
+	uci set anyos_netwatchdog.device.detect_host1="$detect_host1"
+	uci set anyos_netwatchdog.device.detect_host2="$detect_host2"
+	uci set anyos_netwatchdog.device.detect_itv="$detect_itv"
+	uci set anyos_netwatchdog.device.action="$action"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set anyos netwatchdog success"
+
+	json_add_object "data"
+	json_add_string detect_host1 "$detect_host1"
+	json_add_string detect_host2 "$detect_host2"
+	json_add_string detect_itv "$detect_itv"
+	json_add_string action "$action"
+	json_close_object
+
+	uci commit anyos_netwatchdog
+	echo -n "$(json_dump)"
+}
+
+get_parents_ctrl_status(){
+	parents_ctrl_enabled="$(my_uci_get anyos.advance_service.parents_ctrl_enabled)"
+	parents_ctrl_enabled="$((parents_ctrl_enabled ^ 0))"
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"parents_ctrl_enabled success"
+	json_add_string parents_ctrl_enabled "$parents_ctrl_enabled"
+	echo -n "$(json_dump)"
+}
+
+set_parents_ctrl_status(){
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	json_load "$FORM_body"
+	json_get_var parents_ctrl_enabled parents_ctrl_enabled
+	[ -n "$(uci -q get anyos.advance_service)" ] || uci set anyos.advance_service=info
+	parents_ctrl_enabled="$((parents_ctrl_enabled ^ 0))"
+	uci set anyos.advance_service.parents_ctrl_enabled="$parents_ctrl_enabled"
+	position_set="$(uci -q export firewall | grep "config" | wc -l)"
+	parents_ctrl_list="$(uci show firewall | sed -n 's/firewall.parents_ctrl\([0-9]\+\)=rule/\1/p' | sort -n)"
+	for parents_ctrl_tmp in $parents_ctrl_list
+	do
+		uci reorder firewall.parents_ctrl${parents_ctrl_tmp}="$position_set"
+		if [ "$parents_ctrl_enabled" == 0 ];then
+			uci set firewall.parents_ctrl${parents_ctrl_tmp}.enabled="0"
+		elif [ "$parents_ctrl_enabled" == 1 ];then
+			enable_tmp="$(my_uci_get firewall.parents_ctrl${parents_ctrl_tmp}.enabled_stat)"
+			enable_tmp="$((enable_tmp ^ 0))"
+			uci set firewall.parents_ctrl${parents_ctrl_tmp}.enabled="$enable_tmp"
+		fi
+	done
+	for parents_ctrl_tmp in $parents_ctrl_list
+	do
+		uci reorder firewall.parents_ctrl_root${parents_ctrl_tmp}="$position_set"
+		if [ "$parents_ctrl_enabled" == 0 ];then
+			uci set firewall.parents_ctrl_root${parents_ctrl_tmp}.enabled="0"
+		elif [ "$parents_ctrl_enabled" == 1 ];then
+			enable_tmp="$(my_uci_get firewall.parents_ctrl${parents_ctrl_tmp}.enabled_stat)"
+			enable_tmp="$((enable_tmp ^ 0))"
+			uci set firewall.parents_ctrl_root${parents_ctrl_tmp}.enabled="$enable_tmp"
+		fi
+	done
+	uci commit firewall
+	uci commit anyos
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"set parents_ctrl_enabled=$parents_ctrl_enabled success"
+	echo -n "$(json_dump)"
+	(/etc/init.d/firewall restart)&
+}
+
+get_parents_ctrl_rule(){
+	parents_ctrl_rule_list="$(uci show firewall | sed -n 's/firewall.\(parents_ctrl[0-9]\+\)=rule/\1/p')"
+	arp_mac_list="$(awk '{if($3!="HW" && $4!="00:00:00:00:00:00" && $6=="br-lan"){print $4"("$1")"}}' /proc/net/arp)"
+	[ "$(my_uci_get anyos.advance_service.parents_ctrl_no_ip)" == 1 ] && arp_mac_list="$(awk '{if($3!="HW" && $4!="00:00:00:00:00:00" && $6=="br-lan"){print $4}}' /proc/net/arp)"
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"firewall parents_ctrl rule get success"
+	json_add_array 'arp_mac_list'
+	for arp_mac in $arp_mac_list
+	do
+		json_add_string arp_mac	"$arp_mac"
+	done
+	json_close_array
+	json_add_array 'data'
+	for parents_ctrl_rule in $parents_ctrl_rule_list
+	do
+		name="$(my_uci_get firewall.${parents_ctrl_rule}.name)"
+		name="$(echo "$name" | tr -cd "[0-9]")"
+		src_mac="$(my_uci_get firewall.${parents_ctrl_rule}.src_mac | tr "-" ":")"
+		[ "$(my_uci_get anyos.advance_service.parents_ctrl_no_ip)" == 1 ] || src_mac="$(awk -v "src_mac=$src_mac" 'BEGIN{IGNORECASE=1;judge=0} END{if(judge==0){print src_mac}} {if($4==src_mac){print $4"("$1")";judge=1}}' /proc/net/arp)"
+		start_time="$(my_uci_get firewall.${parents_ctrl_rule}.start_time)"
+		stop_time="$(my_uci_get firewall.${parents_ctrl_rule}.stop_time)"
+		weekdays="$(my_uci_get firewall.${parents_ctrl_rule}.weekdays)"
+		description="$(my_uci_get firewall.${parents_ctrl_rule}.description)"
+		enabled="$(my_uci_get firewall.${parents_ctrl_rule}.enabled)"
+		enabled="$((enabled ^ 0))"
+		json_add_object
+		json_add_string name "$name"
+		json_add_string src_mac "$src_mac"
+		json_add_string start_time "$start_time"
+		json_add_string stop_time "$stop_time"
+		json_add_string weekdays "$weekdays"
+		json_add_string description "$description"
+		json_add_string enabled "$enabled"
+		json_close_object
+	done
+	json_close_array
+	echo -n "$(json_dump)"
+}
+
+set_parents_ctrl_rule(){
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	json_load "$FORM_body"
+	json_get_var name name
+	json_get_var src_mac src_mac
+	json_get_var start_time start_time
+	json_get_var stop_time stop_time
+	json_get_var weekdays weekdays
+	json_get_var description description
+	json_get_var name_old name_old
+	json_get_var name_delete name_delete
+	json_get_var enabled enabled
+
+	src_mac="$(echo "$src_mac" | grep -Eoi "^((([a-f0-9]{2}:){5})|(([a-f0-9]{2}-){5}))[a-f0-9]{2}")"
+	if [ -z "$src_mac" ];then
+		json_init
+		json_add_string code "4"
+		json_add_string reason "parents_ctrl src_mac must not be null"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ -n "$weekdays" ];then
+		target="ACCEPT"
+	elif [ -z "$weekdays" ];then
+		target="REJECT"
+	fi
+	if [ -z "$name" ];then
+		max_name_num="$(uci show firewall | sed -n 's/firewall.parents_ctrl\([0-9]\+\)=rule/\1/p' | sort -rn | sed -n 1p | tr -cd "[0-9]")"
+		name="$((max_name_num + 1))"
+	fi
+	name_root="${name:+parents_ctrl_root$name}"
+	name="${name:+parents_ctrl$name}"
+	name_root_old="${name_old:+parents_ctrl_root$name_old}"
+	name_old="${name_old:+parents_ctrl$name_old}"
+	if [ "$name_delete" == 1 ];then
+		#删除 parents_ctrl
+		parents_ctrl_judge="$(uci show firewall | sed -n 's/firewall.\(parents_ctrl[0-9]\+\).name='\'$name\''/\1/p')"
+		parents_ctrl_root_judge="$(uci show firewall | sed -n 's/firewall.\(parents_ctrl_root[0-9]\+\).name='\'$name_root\''/\1/p')"
+		if [ -z "$parents_ctrl_judge" ] || [ -z "$parents_ctrl_root_judge" ];then
+			json_init
+			json_add_string code "2"
+			json_add_string reason	"parents_ctrl name delete fail,no have $name parents_ctrl"
+			echo -n "$(json_dump)"
+			return
+		else
+			#删除 parents_ctrl
+			uci delete firewall.${parents_ctrl_judge}
+			uci delete firewall.${parents_ctrl_root_judge}
+			uci commit firewall
+			json_init
+			json_add_string code "1"
+			json_add_string reason	"delete parents_ctrl success"
+			echo -n "$(json_dump)"
+			(/etc/init.d/firewall restart)&
+			return
+		fi
+	fi
+
+	parents_ctrl_enabled="$(my_uci_get anyos.advance_service.parents_ctrl_enabled)"
+	parents_ctrl_enabled="$((parents_ctrl_enabled ^ 0))"
+	extra_disenabled="$(my_uci_get anyos.advance_service.extra_disenabled)"
+	extra_disenabled="$((extra_disenabled ^ 0))"
+	if [ -n "$name_old" ];then
+	#name_old存在 修改 parents_ctrl
+		parents_ctrl_old_judge="$(uci show firewall | sed -n 's/firewall.\(parents_ctrl[0-9]\+\).name='\'$name_old\''/\1/p')"
+		parents_ctrl_root_old_judge="$(uci show firewall | sed -n 's/firewall.\(parents_ctrl_root[0-9]\+\).name='\'$name_root_old\''/\1/p')"
+		if [ -z "$parents_ctrl_old_judge" ] || [ -z "$parents_ctrl_root_old_judge" ];then
+			json_init
+			json_add_string code "8"
+			json_add_string reason	"firewall parents_ctrl name change fail,no have $name_old parents_ctrl"
+			echo -n "$(json_dump)"
+			return
+		fi
+		#判断要修改的 name 是否与旧的 parents_ctrl 重名
+		if [ "$name_old" != "$name" ];then
+			parents_ctrl_judge="$(uci show firewall | sed -n 's/firewall.\(parents_ctrl[0-9]\+\).name='\'$name\''/\1/p')"
+			parents_ctrl_root_judge="$(uci show firewall | sed -n 's/firewall.\(parents_ctrl_root[0-9]\+\).name='\'$name_root\''/\1/p')"
+			if [ -n "$parents_ctrl_judge" ] || [ -n "$parents_ctrl_root_judge" ];then
+				json_init
+				json_add_string code "9"
+				json_add_string reason	"parents_ctrl name set fail,firewall have $name parents_ctrl"
+				echo -n "$(json_dump)"
+				return
+			fi
+		fi
+		#修改防火墙
+		uci set firewall.${parents_ctrl_old_judge}.name="$name"
+		uci set firewall.${parents_ctrl_old_judge}.src="*"
+		uci set firewall.${parents_ctrl_old_judge}.dest="*"
+		uci set firewall.${parents_ctrl_old_judge}.src_mac="$src_mac"
+		uci set firewall.${parents_ctrl_old_judge}.target="$target"
+		uci set firewall.${parents_ctrl_old_judge}.start_time="$start_time"
+		uci set firewall.${parents_ctrl_old_judge}.stop_time="$stop_time"
+		uci set firewall.${parents_ctrl_old_judge}.weekdays="$weekdays"
+		uci set firewall.${parents_ctrl_old_judge}.description="$description"
+		if [ "$parents_ctrl_enabled" == 0 ];then
+			uci set firewall.${parents_ctrl_old_judge}.enabled="0"
+		else
+			if [ -z "$weekdays" ];then
+				uci set firewall.${parents_ctrl_old_judge}.enabled="0"
+			else
+				uci set firewall.${parents_ctrl_old_judge}.enabled="$enabled"
+			fi
+		fi
+		if [ -z "$weekdays" ];then
+			uci set firewall.${parents_ctrl_old_judge}.enabled_stat="0"
+		else
+			uci set firewall.${parents_ctrl_old_judge}.enabled_stat="$enabled"
+		fi
+		[ "$extra_disenabled" == 0 ] && uci set firewall.${parents_ctrl_old_judge}.extra="--kerneltz"
+		uci rename firewall.${parents_ctrl_old_judge}="$name"
+		#parents_ctrl_root
+		uci set firewall.${parents_ctrl_root_old_judge}.name="$name_root"
+		uci set firewall.${parents_ctrl_root_old_judge}.src="*"
+		uci set firewall.${parents_ctrl_root_old_judge}.dest="*"
+		uci set firewall.${parents_ctrl_root_old_judge}.target="REJECT"
+		uci set firewall.${parents_ctrl_root_old_judge}.src_mac="$src_mac"
+		if [ "$parents_ctrl_enabled" == 0 ];then
+			uci set firewall.${parents_ctrl_root_old_judge}.enabled="0"
+		else
+			uci set firewall.${parents_ctrl_root_old_judge}.enabled="$enabled"
+		fi
+		uci set firewall.${parents_ctrl_root_old_judge}.enabled_stat="$enabled"
+		uci rename firewall.${parents_ctrl_root_old_judge}="$name_root"
+	else
+	#name_old不存在 添加 parents_ctrl 判断要添加的 name 是否与旧的 parents_ctrl 重名
+		parents_ctrl_judge="$(uci show firewall | sed -n 's/firewall.\(parents_ctrl[0-9]\+\).name='\'$name\''/\1/p')"
+		parents_ctrl_root_judge="$(uci show firewall | sed -n 's/firewall.\(parents_ctrl_root[0-9]\+\).name='\'$name_root\''/\1/p')"
+		if [ -n "$parents_ctrl_judge" ] || [ -n "$parents_ctrl_root_judge" ];then
+			json_init
+			json_add_string code "9"
+			json_add_string reason	"parents_ctrl name set fail,network have $name parents_ctrl"
+			echo -n "$(json_dump)"
+			return
+		fi
+		uci set firewall.${name}="rule"
+		uci set firewall.${name}.name="$name"
+		uci set firewall.${name}.src="*"
+		uci set firewall.${name}.dest="*"
+		uci set firewall.${name}.src_mac="$src_mac"
+		uci set firewall.${name}.target="$target"
+		uci set firewall.${name}.start_time="$start_time"
+		uci set firewall.${name}.stop_time="$stop_time"
+		uci set firewall.${name}.weekdays="$weekdays"
+		uci set firewall.${name}.description="$description"
+		if [ "$parents_ctrl_enabled" == 0 ];then
+			uci set firewall.${name}.enabled="0"
+		else
+			if [ -z "$weekdays" ];then
+				uci set firewall.${name}.enabled="0"
+			else
+				uci set firewall.${name}.enabled="$enabled"
+			fi
+		fi
+		if [ -z "$weekdays" ];then
+			uci set firewall.${name}.enabled_stat="0"
+		else
+			uci set firewall.${name}.enabled_stat="$enabled"
+		fi
+		[ "$extra_disenabled" == 0 ] && uci set firewall.${name}.extra="--kerneltz"
+		#parents_ctrl_root
+		uci set firewall.${name_root}="rule"
+		uci set firewall.${name_root}.name="$name_root"
+		uci set firewall.${name_root}.src="*"
+		uci set firewall.${name_root}.dest="*"
+		uci set firewall.${name_root}.target="REJECT"
+		uci set firewall.${name_root}.src_mac="$src_mac"
+		if [ "$parents_ctrl_enabled" == 0 ];then
+			uci set firewall.${name_root}.enabled="0"
+		else
+			uci set firewall.${name_root}.enabled="$enabled"
+		fi
+		uci set firewall.${name_root}.enabled_stat="$enabled"
+	fi
+
+	#排序 选择
+	position_set="$(uci -q export firewall | grep "config" | wc -l)"
+	parents_ctrl_list="$(uci show firewall | sed -n 's/firewall.parents_ctrl\([0-9]\+\)=rule/\1/p' | sort -n)"
+	for parents_ctrl_tmp in $parents_ctrl_list
+	do
+		uci reorder firewall.parents_ctrl${parents_ctrl_tmp}="$position_set"
+	done
+	for parents_ctrl_tmp in $parents_ctrl_list
+	do
+		uci reorder firewall.parents_ctrl_root${parents_ctrl_tmp}="$position_set"
+	done
+	uci commit firewall
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"set parents_ctrl set success"
+	echo -n "$(json_dump)"
+	(/etc/init.d/firewall restart)&
+}
+
+get_acl_rule(){
+	acl_rule_list="$(uci show firewall | sed -n 's/firewall.\(acl[0-9]\+\)=rule/\1/p')"
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"firewall acl rule get success"
+	json_add_array 'data'
+	for acl_rule in $acl_rule_list
+	do
+		name="$(my_uci_get firewall.${acl_rule}.name)"
+		name="$(echo "$name" | tr -cd "[0-9]")"
+		proto="$(my_uci_get firewall.${acl_rule}.proto)"
+		proto="$(echo "$proto" | tr ' ' '+')"
+		src_ip="$(my_uci_get firewall.${acl_rule}.src_ip)"
+		src_port="$(my_uci_get firewall.${acl_rule}.src_port)"
+		dest="$(my_uci_get firewall.${acl_rule}.dest)"
+		if [ -z "$dest" ];then
+			data_flow="input"
+		else
+			data_flow="forward"
+		fi
+		dest_ip="$(my_uci_get firewall.${acl_rule}.dest_ip)"
+		dest_port="$(my_uci_get firewall.${acl_rule}.dest_port)"
+		target="$(my_uci_get firewall.${acl_rule}.target)"
+		enabled="$(my_uci_get firewall.${acl_rule}.enabled)"
+		enabled="$((enabled ^ 0))"
+		json_add_object
+		json_add_string name "$name"
+		json_add_string proto "$proto"
+		json_add_string src_ip "$src_ip"
+		json_add_string src_port "$src_port"
+		json_add_string dest_ip "$dest_ip"
+		json_add_string dest_port "$dest_port"
+		json_add_string data_flow "$data_flow"
+		json_add_string target "$target"
+		json_add_string enabled "$enabled"
+		json_close_object
+	done
+	json_close_array
+	echo -n "$(json_dump)"
+}
+
+set_acl_rule(){
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	json_load "$FORM_body"
+	json_get_var name name
+	json_get_var proto proto
+	json_get_var src_ip src_ip
+	json_get_var src_port src_port
+	json_get_var dest_ip dest_ip
+	json_get_var dest_port dest_port
+	json_get_var data_flow data_flow
+	json_get_var target target
+	json_get_var name_old name_old
+	json_get_var name_delete name_delete
+	json_get_var enabled enabled
+	name_numbe_judge="$(echo "$name" | grep -w "[0-9]\+")"
+	if [ -z "$name" ] || [ -z "$name_numbe_judge" ];then
+		json_init
+		json_add_string code "4"
+		json_add_string reason "acl_rule priority must not be null and use number"
+		echo -n "$(json_dump)"
+		return
+	fi
+	src="*"
+	if [ "$data_flow" == "forward" ];then
+		dest="*"
+	else
+		dest=""
+	fi
+	name="${name:+acl$name}"
+	name_old="${name_old:+acl$name_old}"
+	proto="$(echo "$proto" | tr '+' ' ')"
+
+	if [ -n "$src_port" ];then
+		src_dport_test="$(echo "$src_port" | tr -d "[0-9]")"
+		if [ "$src_dport_test" = "-" ];then
+			src_dport_start="$(echo "$src_port" | sed -n 's/\([0-9]\+\)-[0-9]\+/\1/p')"
+			src_dport_stop="$(echo "$src_port" | sed -n 's/[0-9]\+-\([0-9]\+\)/\1/p')"
+			if [ -z "$src_dport_start" ] || [ -z "$src_dport_stop" ] || \
+			[ "$src_dport_start" -gt 65535 -o "$src_dport_start" -lt 0 ] || \
+			[ "$src_dport_stop" -gt 65535 -o "$src_dport_stop" -lt 0 ] || \
+			[ "$src_dport_start" -gt "$src_dport_stop" ];then
+				src_dport_judge=fail
+			fi
+		elif [ -z "$src_dport_test" ];then
+			if [ -n "$src_port" ] && [ "$src_port" -gt 65535 -o "$src_port" -lt 0 ];then
+				src_dport_judge=fail
+			fi
+		else
+			src_dport_judge=fail
+		fi
+	fi
+
+	if [ "$src_dport_judge" == "fail" ];then
+		json_init
+		json_add_string code "5"
+		json_add_string reason "src_port is not right"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ -n "$dest_port" ];then
+		dest_port_test="$(echo "$dest_port" | tr -d "[0-9]")"
+		if [ "$dest_port_test" = "-" ];then
+			dest_port_start="$(echo "$dest_port" | sed -n 's/\([0-9]\+\)-[0-9]\+/\1/p')"
+			dest_port_stop="$(echo "$dest_port" | sed -n 's/[0-9]\+-\([0-9]\+\)/\1/p')"
+			if [ -z "$dest_port_start" ] || [ -z "$dest_port_stop" ] || \
+			[ "$dest_port_start" -gt 65535 -o "$dest_port_start" -lt 0 ] || \
+			[ "$dest_port_stop" -gt 65535 -o "$dest_port_stop" -lt 0 ] || \
+			[ "$dest_port_start" -gt "$dest_port_stop" ];then
+				dest_port_judge=fail
+			fi
+		elif [ -z "$dest_port_test" ];then
+			if [ -n "$dest_port" ] && [ "$dest_port" -gt 65535 -o "$dest_port" -lt 0 ];then
+				dest_port_judge=fail
+			fi
+		else
+			dest_port_judge=fail
+		fi
+	fi
+
+	if [ "$dest_port_judge" == "fail" ];then
+		json_init
+		json_add_string code "6"
+		json_add_string reason "dest_port is not right"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ "$name_delete" == 1 ];then
+		#删除 acl_rule
+		acl_rule_judge="$(uci show firewall | sed -n 's/firewall.\(acl[0-9]\+\).name='\'$name\''/\1/p')"
+		if [ -z "$acl_rule_judge" ];then
+			json_init
+			json_add_string code "2"
+			json_add_string reason	"acl_rule name delete fail,no have $name acl_rule"
+			echo -n "$(json_dump)"
+			return
+		else
+			#删除 acl_rule
+			uci delete firewall.${acl_rule_judge}
+			uci commit firewall
+			json_init
+			json_add_string code "1"
+			json_add_string reason	"delete acl_rule success"
+			echo -n "$(json_dump)"
+			(/etc/init.d/firewall restart)&
+			return
+		fi
+	fi
+
+	acl_enabled="$(my_uci_get anyos.advance_service.acl_enabled)"
+	acl_enabled="$((acl_enabled ^ 0))"
+	if [ -n "$name_old" ];then
+	#name_old存在 修改 acl_rule
+		acl_rule_old_judge="$(uci show firewall | sed -n 's/firewall.\(acl[0-9]\+\).name='\'$name_old\''/\1/p')"
+		if [ -z "$acl_rule_old_judge" ];then
+			json_init
+			json_add_string code "8"
+			json_add_string reason	"firewall acl_rule name change fail,no have $name_old acl_rule"
+			echo -n "$(json_dump)"
+			return
+		fi
+		#判断要修改的 name 是否与旧的 acl_rule 重名
+		if [ "$name_old" != "$name" ];then
+			acl_rule_judge="$(uci show firewall | sed -n 's/firewall.\(acl[0-9]\+\).name='\'$name\''/\1/p')"
+			if [ -n "$acl_rule_judge" ];then
+				json_init
+				json_add_string code "9"
+				json_add_string reason	"acl_rule name set fail,firewall have $name acl_rule"
+				echo -n "$(json_dump)"
+				return
+			fi
+		fi
+		#修改防火墙
+		uci set firewall.${acl_rule_old_judge}.name="$name"
+		uci set firewall.${acl_rule_old_judge}.proto="$proto"
+		uci set firewall.${acl_rule_old_judge}.src="$src"
+		uci set firewall.${acl_rule_old_judge}.src_ip="$src_ip"
+		uci set firewall.${acl_rule_old_judge}.src_port="$src_port"
+		uci set firewall.${acl_rule_old_judge}.dest="$dest"
+		uci set firewall.${acl_rule_old_judge}.dest_ip="$dest_ip"
+		uci set firewall.${acl_rule_old_judge}.dest_port="$dest_port"
+		uci set firewall.${acl_rule_old_judge}.target="$target"
+		if [ "$acl_enabled" == 0 ];then
+			uci set firewall.${acl_rule_old_judge}.enabled="0"
+		else
+			uci set firewall.${acl_rule_old_judge}.enabled="$enabled"
+		fi
+		uci set firewall.${acl_rule_old_judge}.enabled_stat="$enabled"
+		uci rename firewall.${acl_rule_old_judge}="$name"
+	else
+	#name_old不存在 添加 acl_rule 判断要添加的 name 是否与旧的 acl_rule 重名
+		acl_rule_judge="$(uci show firewall | sed -n 's/firewall.\(acl[0-9]\+\).name='\'$name\''/\1/p')"
+		if [ -n "$acl_rule_judge" ];then
+				json_init
+				json_add_string code "9"
+				json_add_string reason	"acl_rule name set fail,network have $name acl_rule"
+				echo -n "$(json_dump)"
+				return
+		fi
+		acl_rule_judge="${name}"
+		uci set firewall.${acl_rule_judge}="rule"
+		uci set firewall.${acl_rule_judge}.name="$name"
+		uci set firewall.${acl_rule_judge}.proto="$proto"
+		uci set firewall.${acl_rule_judge}.src="$src"
+		uci set firewall.${acl_rule_judge}.src_ip="$src_ip"
+		uci set firewall.${acl_rule_judge}.src_port="$src_port"
+		uci set firewall.${acl_rule_judge}.dest="$dest"
+		uci set firewall.${acl_rule_judge}.dest_ip="$dest_ip"
+		uci set firewall.${acl_rule_judge}.dest_port="$dest_port"
+		uci set firewall.${acl_rule_judge}.target="$target"
+		if [ "$acl_enabled" == 0 ];then
+			uci set firewall.${acl_rule_judge}.enabled="0"
+		else
+			uci set firewall.${acl_rule_judge}.enabled="$enabled"
+		fi
+		uci set firewall.${acl_rule_judge}.enabled_stat="$enabled"
+	fi
+
+	#排序 选择
+	position_set=0
+	acl_list="$(uci show firewall | sed -n 's/firewall.acl\([0-9]\+\)=rule/\1/p' | sort -rn)"
+	for acl_tmp in $acl_list
+	do
+		uci reorder firewall.acl${acl_tmp}="$position_set"
+	done
+	uci commit firewall
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"set acl_rule set success"
+	echo -n "$(json_dump)"
+	(/etc/init.d/firewall restart)&
+}
+
+get_acl_status(){
+	acl_enabled="$(my_uci_get anyos.advance_service.acl_enabled)"
+	acl_enabled="$((acl_enabled ^ 0))"
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"get_acl_enabled success"
+	json_add_string acl_enabled	"$acl_enabled"
+	echo -n "$(json_dump)"
+}
+
+set_acl_status(){
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	json_load "$FORM_body"
+	json_get_var acl_enabled acl_enabled
+	[ -n "$(uci -q get anyos.advance_service)" ] || uci set anyos.advance_service=info
+	acl_enabled="$((acl_enabled ^ 0))"
+	uci set anyos.advance_service.acl_enabled="$acl_enabled"
+	position_set=0
+	acl_list="$(uci show firewall | sed -n 's/firewall.acl\([0-9]\+\)=rule/\1/p' | sort -rn)"
+	for acl_tmp in $acl_list
+	do
+		uci reorder firewall.acl${acl_tmp}="$position_set"
+		if [ "$acl_enabled" == 0 ];then
+			uci set firewall.acl${acl_tmp}.enabled="0"
+		elif [ "$acl_enabled" == 1 ];then
+			enable_tmp="$(my_uci_get firewall.acl${acl_tmp}.enabled_stat)"
+			enable_tmp="$((enable_tmp ^ 0))"
+			uci set firewall.acl${acl_tmp}.enabled="$enable_tmp"
+		fi
+	done
+	uci commit firewall
+	uci commit anyos
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"set acl_enabled=$acl_enabled success"
+	echo -n "$(json_dump)"
+	(/etc/init.d/firewall restart)&
+}
+
+get_mac_blacklist(){
+	arp_mac_list="$(awk '{if($3!="HW" && $4!="00:00:00:00:00:00"){print $4"("$1")"}}' /proc/net/arp)"
+	mac_blacklist="$(cat /etc/firewall.mac_blacklist | grep -wEoi "((([a-f0-9]{2}:){5})|(([a-f0-9]{2}-){5}))[a-f0-9]{2}" | tr "-" ":")"
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"firewall get_mac_blacklist rule get success"
+	json_add_array 'arp_mac_list'
+	for arp_mac in $arp_mac_list
+	do
+		json_add_string arp_mac	"$arp_mac"
+	done
+	json_close_array
+	json_add_array "mac_blacklist"
+	for mac_tmp in $mac_blacklist;do
+		mac_tmp="$(awk -v "mac_tmp=$mac_tmp" 'BEGIN{IGNORECASE=1;judge=0} END{if(judge==0){print mac_tmp}} {if($4==mac_tmp){print $4"("$1")";judge=1}}' /proc/net/arp)"
+		json_add_string mac "$mac_tmp"
+	done
+	json_close_array
+	echo -n "$(json_dump)"
+}
+
+set_mac_blacklist(){
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	[ -e /etc/firewall.mac_blacklist ] || touch /etc/firewall.mac_blacklist
+	firewall_judge="$(uci show firewall | grep -E "firewall\..*\.path='/etc/firewall\.mac_blacklist'")"
+	if [ -z "$firewall_judge" ];then
+		section="$(uci add firewall include)"
+		uci set firewall.${section}.path="/etc/firewall.mac_blacklist"
+	fi
+	operation=REJECT
+	json_load   "$FORM_body"
+	json_select mac_blacklist
+	index=1
+	macline=""
+	sed -i '1,$d' /etc/firewall.mac_blacklist
+	while [ 1 ];do
+		json_get_var macaddr "${index}"
+		if [ -z "$macaddr" ];then
+			break
+		else
+			index="$((index+1))"
+		fi
+		macaddr_tmp="$macaddr"
+		macaddr="$(echo "$macaddr" | grep -Eoi "^((([a-f0-9]{2}:){5})|(([a-f0-9]{2}-){5}))[a-f0-9]{2}" | tr "-" ":")"
+		if [ -z "$macaddr" ];then
+			macaddr_error="$(echo -e "${macaddr_error}\n${macaddr_tmp}" | sed '/^$/d')"
+		else
+			echo "iptables -t filter -I FORWARD -m mac --mac-source ${macaddr} -j ${operation}" >> /etc/firewall.mac_blacklist
+		fi
+	done
+	uci commit firewall
+	if [ -z "$macaddr_error" ];then
+		json_init
+		json_add_string code  "1"
+		json_add_string reason  "set_mac_blacklist success"
+		json_add_array "macaddr_error"
+		json_close_array
+	elif [ -n "$macaddr_error" ];then
+		json_init
+		json_add_string code  "4"
+		json_add_string reason  "set_mac_blacklist have error"
+		json_add_array "macaddr_error"
+		all_line="$(echo "$macaddr_error" | wc -l)"
+		count=1
+		while [ "$count" -le "$all_line" ];do
+			error_line="$(echo "$macaddr_error" | awk 'NR=="'"$count"'" {print $0}')"
+			json_add_string error_line "$error_line"
+			count="$((count + 1))"
+		done
+		json_close_array
+	fi
+	echo -n "$(json_dump)"
+	(/etc/init.d/firewall restart)&
+}
+
+get_static_route(){
+	static_route_list="$(uci show network | sed -n 's/network.\(\@route\[[0-9]\+\]\)=route/\1/p')"
+	interface_list="$(uci show network | grep "=interface" | awk -F '.' '{print $2}' | awk -F '=' '{print $1}' | grep -v "loopback")"
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"get_static_route get success"
+	json_add_array "interface_list"
+	for interface_tmp in $interface_list;do
+		json_add_string interface_tmp "$interface_tmp"
+	done
+	json_close_array
+	json_add_array 'data'
+	for static_route_section in $static_route_list
+	do
+		interface="$(my_uci_get network.${static_route_section}.interface)"
+		target="$(my_uci_get network.${static_route_section}.target)"
+		netmask="$(my_uci_get network.${static_route_section}.netmask)"
+		gateway="$(my_uci_get network.${static_route_section}.gateway)"
+		metric="$(my_uci_get network.${static_route_section}.metric)"
+		name="$(my_uci_get network.${static_route_section}.name)"
+		name="$(echo "$name" | tr -cd "[0-9]")"
+
+		json_add_object
+		json_add_string interface "$interface"
+		json_add_string target "$target"
+		json_add_string netmask "$netmask"
+		json_add_string gateway "$gateway"
+		json_add_string metric "$metric"
+		json_add_string name "$name"
+		json_close_object
+	done
+	json_close_array
+	echo -n "$(json_dump)"
+}
+
+set_static_route(){
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	json_load "$FORM_body"
+	json_get_var interface interface
+	json_get_var target target
+	json_get_var netmask netmask
+	json_get_var gateway gateway
+	json_get_var metric metric
+
+	json_get_var name name
+	json_get_var name_old name_old
+	json_get_var name_delete name_delete
+
+	if [ -z "$interface" ] || [ -z "$target" ];then
+		json_init
+		json_add_string code "10"
+		json_add_string reason	"static_route no have interface or target"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ -z "$name" ];then
+		max_name_num="$(uci show network | sed -n 's/network.\(\@route\[[0-9]\+\]\).name='\''static_route\([0-9]\+\)'\''/\2/p' | sort -rn | sed -n 1p | tr -cd "[0-9]")"
+		name="$((max_name_num + 1))"
+	fi
+
+	name="${name:+static_route$name}"
+	name_old="${name_old:+static_route$name_old}"
+
+	if [ "$name_delete" == 1 ];then
+		#删除 static_route 判断name 是否存在
+		static_route_judge="$(uci show network | sed -n 's/network.\(\@route\[[0-9]\+\]\).name='\'$name\''/\1/p')"
+		if [ -z "$static_route_judge" ];then
+			json_init
+			json_add_string code "2"
+			json_add_string reason	"static_route name delete fail,no have $name static_route"
+			echo -n "$(json_dump)"
+			return
+		else
+			#删除 static_route
+			uci delete network.${static_route_judge}
+			uci commit network
+			json_init
+			json_add_string code "1"
+			json_add_string reason	"delete static_route success"
+			echo -n "$(json_dump)"
+			(sleep 2;/etc/init.d/network restart)&
+			return
+		fi
+	fi
+
+	if [ -n "$name_old" ];then
+	#name_old存在 修改 static_route
+		static_route_old_judge="$(uci show network | sed -n 's/network.\(\@route\[[0-9]\+\]\).name='\'$name_old\''/\1/p')"
+		if [ -z "$static_route_old_judge" ];then
+			json_init
+			json_add_string code "8"
+			json_add_string reason	"network static_route name change fail,no have $name_old static_route"
+			echo -n "$(json_dump)"
+			return
+		fi
+		#判断要修改的 name 是否与旧的 static_route 重名
+		if [ "$name_old" != "$name" ];then
+			static_route_judge="$(uci show network | sed -n 's/network.\(\@route\[[0-9]\]\+\).name='\'$name\''/\1/p')"
+			if [ -n "$static_route_judge" ];then
+				json_init
+				json_add_string code "9"
+				json_add_string reason	"static_route name set fail,network have $name static_route"
+				echo -n "$(json_dump)"
+				return
+			fi
+		fi
+		uci set network.${static_route_old_judge}.name="$name"
+		uci set network.${static_route_old_judge}.interface="$interface"
+		uci set network.${static_route_old_judge}.target="$target"
+		uci set network.${static_route_old_judge}.netmask="$netmask"
+		uci set network.${static_route_old_judge}.gateway="$gateway"
+		uci set network.${static_route_old_judge}.metric="$metric"
+	else
+	#name_old不存在 添加 static_route 判断要添加的 name 是否与旧的 static_route 重名
+		static_route_judge="$(uci show network | sed -n 's/network.\(\@route\[[0-9]\]\+\).name='\'$name\''/\1/p')"
+		if [ -n "$static_route_judge" ];then
+			json_init
+			json_add_string code "9"
+			json_add_string reason	"static_route name set fail,network have $name static_route"
+			echo -n "$(json_dump)"
+			return
+		fi
+		static_route_section="$(uci add network route)"
+		uci set network.${static_route_section}.name="$name"
+		uci set network.${static_route_section}.interface="$interface"
+		uci set network.${static_route_section}.target="$target"
+		uci set network.${static_route_section}.netmask="$netmask"
+		uci set network.${static_route_section}.gateway="$gateway"
+		uci set network.${static_route_section}.metric="$metric"
+	fi
+	uci commit network
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"set static_route set success"
+	echo -n "$(json_dump)"
+	(sleep 2;/etc/init.d/network restart)&
+}
+
+get_ddns(){
+	services_list="$(awk -F "\"" '{print $2}' /usr/sbin/anywifi/ddns/services)"
+	services="$(my_uci_get any_ddns.default.services)"
+	username="$(my_uci_get any_ddns.default.username)"
+	password="$(my_uci_get any_ddns.default.password)"
+	domain="$(my_uci_get any_ddns.default.domain)"
+	enabled="$(my_uci_get any_ddns.default.enabled)"
+	enabled="$((enabled ^ 0))"
+	poll_time="$(my_uci_get any_ddns.default.poll_time)"
+	[ "$poll_time" -ge 600 ] || poll_time=600
+	local log_path="$(my_uci_get any_ddns.default.log_path)"
+	[ -z "$log_path" ] && log_path="/tmp/log/any_ddns_log"
+	log_max_line="$(my_uci_get any_ddns.default.log_max_line)"
+	[ "$log_max_line" -ge 100 ] || log_max_line=100
+	wait_time="$(my_uci_get any_ddns.default.wait_time)"
+	[ "$wait_time" -ge 5 ] || wait_time=5
+	description="$(my_uci_get any_ddns.default.description)"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"get_ddns get success"
+	json_add_array "services_list"
+	for services_tmp in $services_list;do
+		json_add_string services_tmp "$services_tmp"
+	done
+	json_close_array
+	json_add_string services "$services"
+	json_add_string username "$username"
+	json_add_string password "$password"
+	json_add_string domain "$domain"
+	json_add_string enabled "$enabled"
+	json_add_string poll_time "$poll_time"
+	json_add_string log_path "$log_path"
+	json_add_string log_max_line "$log_max_line"
+	json_add_string wait_time "$wait_time"
+	json_add_string description "$description"
+	echo -n "$(json_dump)"
+}
+
+set_ddns(){
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	json_load "$FORM_body"
+	json_get_var services services
+	json_get_var username username
+	json_get_var password password
+	json_get_var domain domain
+	json_get_var enabled enabled
+	json_get_var poll_time poll_time
+	json_get_var log_path log_path
+	json_get_var log_max_line log_max_line
+	json_get_var wait_time wait_time
+	json_get_var description description
+
+	if [ -z "$services"] || [ -z "$username"] || [ -z "$password"] || [ -z "$domain"] || [ -z "$enabled"] || [ -z "$poll_time"] || [ -z "$wait_time" ];then
+		json_init
+		json_add_string code "2"
+		json_add_string reason "have parameter is empty"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	services_judge="$(awk -F "\"" '{print $2}' /usr/sbin/anywifi/ddns/services | grep -m 1 -wo $services)"
+	if [ -z "$services_judge"];then
+		json_init
+		json_add_string code "3"
+		json_add_string reason "Service $services is not supported"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	poll_time_judge=0
+	[ "$poll_time" -ge 600 ] || poll_time_judge=1
+	if [ "$poll_time_judge" == 1 ];then
+		json_init
+		json_add_string code "5"
+		json_add_string reason "Polling time is at least 600 seconds,now poll_time=$poll_time"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	log_max_line_judge=0
+	[ "$log_max_line" -ge 100 ] || log_max_line_judge=1
+	if [ "$log_max_line_judge" == 1 ];then
+		json_init
+		json_add_string code "6"
+		json_add_string reason "log_max_line is at least 100,now log_max_line=$log_max_line"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	wait_time_judge=0
+	[ "$wait_time" -ge 5 ] || wait_time_judge=1
+	if [ "$wait_time_judge" == 1 ];then
+		json_init
+		json_add_string code "7"
+		json_add_string reason "wait_time is at least 5,now wait_time=$wait_time"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	uci set any_ddns.default.services="$services"
+	uci set any_ddns.default.username="$username"
+	uci set any_ddns.default.password="$password"
+	uci set any_ddns.default.domain="$domain"
+	uci set any_ddns.default.enabled="$enabled"
+	uci set any_ddns.default.poll_time="$poll_time"
+	uci set any_ddns.default.log_path="$log_path"
+	uci set any_ddns.default.log_max_line="$log_max_line"
+	uci set any_ddns.default.wait_time="$wait_time"
+	uci set any_ddns.default.description="$description"
+	uci commit any_ddns
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"set set_ddns success"
+	echo -n "$(json_dump)"
+	(/etc/init.d/any_ddns restart) &
+}
+
+get_ddns_log(){
+	local LOG_PATH="$(my_uci_get any_ddns.default.log_path)"
+	[ -n "$LOG_PATH" ] || LOG_PATH="/tmp/log/any_ddns_log"
+	ddns_log="$(cat $LOG_PATH)"
+	[ -n "$ddns_log" ] || ddns_log="NO HAVE LOG"
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"get_ddns_log success"
+	json_add_string ddns_log "$ddns_log"
+	echo -n "$(json_dump)"
+}
+
+ddns_detection(){
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	poll_time="$(my_uci_get any_ddns.default.poll_time)"
+	[ "$poll_time" -ge 600 ] || poll_time=600
+	local LOG_PATH="$(my_uci_get any_ddns.default.log_path)"
+	[ -n "$LOG_PATH" ] || LOG_PATH="/tmp/log/any_ddns_log"
+	[ -d "${LOG_PATH%/*}" ] || mkdir -p "${LOG_PATH%/*}"
+	local log_date="$(date "+%Y-%m-%d %H:%M:%S")"
+	[ -e "$LOG_PATH" ] || echo "$log_date Start logging" > "$LOG_PATH"
+	ddns_detection_line="$log_date START_DETECTION"
+	sed -i "1i ${ddns_detection_line}" "$LOG_PATH"
+	/etc/init.d/any_ddns restart
+	detection_ret="DDNS_DETECTION_ERROR"
+	#阻塞值最小5s
+	local wait_time="$(my_uci_get any_ddns.default.wait_time)"
+	[ "$wait_time" -ge 5 ] || wait_time=5
+	count=0
+	#最多阻塞 wait_time
+	while [ "$detection_ret" == "DDNS_DETECTION_ERROR" -a "$count" -le "$wait_time" ];do
+		detection_ret_head="$(awk 'BEGIN{end_judge=0} {if(end_judge==0){print $0};if($3=="START_DETECTION"){end_judge=1}}' $LOG_PATH)"
+		detection_ret="$(echo "$detection_ret_head" | awk -v "poll_time=${poll_time}s" 'BEGIN{start_judge=0} END{if(start_judge==0){print "DDNS_DETECTION_ERROR"}} {if($3=="sleep" && $4==poll_time){start_judge=1};if(start_judge==1){print $0}}')"
+		sleep 1
+		count="$((count + 1))"
+	done
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"ddns_detection get success"
+	json_add_string detection_ret "$detection_ret"
+	echo -n "$(json_dump)"
+}
+
+get_ddns_stat(){
+	update_success="$(cat /tmp/any_ddns_stat)"
+	update_success="$((update_success ^ 0))"
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"get_ddns_stat success"
+	json_add_string update_success "$update_success"
+	echo -n "$(json_dump)"
+}
+
+get_static_dhcp(){
+	if [ "$(my_uci_get anyos.advance_service.parents_ctrl_no_ip)" == 1 ];then
+		arp_mac_list="$(awk '{if($3!="HW" && $4!="00:00:00:00:00:00"){print $4}}' /proc/net/arp | sort -u | tr '[a-z]' '[A-Z]')"
+	else
+		arp_mac_list="$(awk '{if($3!="HW" && $4!="00:00:00:00:00:00"){print $4"("$1")"}}' /proc/net/arp | tr '[a-z]' '[A-Z]')"
+	fi
+	static_dhcp_list="$(uci show dhcp | sed -n 's/dhcp.\(@host\[[0-9]\+\]\)=host/\1/p')"
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"get_static_dhcp success"
+	json_add_array 'arp_mac_list'
+	for arp_mac in $arp_mac_list
+	do
+		json_add_string arp_mac	"$arp_mac"
+	done
+	json_close_array
+	json_add_array 'data'
+	for static_dhcp in $static_dhcp_list
+	do
+		name="$(my_uci_get dhcp.${static_dhcp}.name)"
+		mac="$(my_uci_get dhcp.${static_dhcp}.mac)"
+		ip="$(my_uci_get dhcp.${static_dhcp}.ip)"
+		leasetime="$(my_uci_get dhcp.${static_dhcp}.leasetime)"
+		json_add_object
+		json_add_string name "$name"
+		json_add_string mac "$mac"
+		json_add_string ip "$ip"
+		json_add_string leasetime "$leasetime"
+		json_close_object
+	done
+	json_close_array
+
+	echo -n "$(json_dump)"
+}
+
+set_static_dhcp(){
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	json_load "$FORM_body"
+	json_get_var name name
+	json_get_var mac mac
+	json_get_var ip ip
+	json_get_var leasetime leasetime
+	mac="$(echo "$mac" | grep -Eoi "^((([a-f0-9]{2}:){5})|(([a-f0-9]{2}-){5}))[a-f0-9]{2}" | tr "-" ":")"
+	if [ -z "$mac" ];then
+		json_init
+		json_add_string code "4"
+		json_add_string reason "set_static_dhcp use mac"
+		echo -n "$(json_dump)"
+		return
+	fi
+	dns="1"
+	[ -z "$name" ] && dns="0"
+	#检测mac是否有冲突
+	static_dhcp_judge="$(uci show dhcp | sed -n 's/dhcp.\(@host\[[0-9]\+\]\).mac='\'$mac\''/\1/p')"
+	if [ -n "$static_dhcp_judge" ];then
+		uci del dhcp.${static_dhcp_judge}
+	fi
+	static_dhcp_section="$(uci add dhcp host)"
+	uci set dhcp.${static_dhcp_section}.name="$name"
+	uci set dhcp.${static_dhcp_section}.mac="$mac"
+	uci set dhcp.${static_dhcp_section}.ip="$ip"
+	uci set dhcp.${static_dhcp_section}.leasetime="$leasetime"
+	uci set dhcp.${static_dhcp_section}.dns="$dns"
+	uci commit dhcp
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"static_dhcp set success"
+	echo -n "$(json_dump)"
+	(sleep 2;/etc/init.d/dnsmasq restart)&
+}
+
+delete_static_dhcp(){
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	json_load "$FORM_body"
+	json_select maclist
+	index=1
+	del_error=""
+	while [ 1 ];do
+		json_get_var macaddr "${index}"
+		if [ -z "$macaddr" ];then
+			break
+		else
+			index="$((index+1))"
+		fi
+		mac="$(echo "$macaddr" | grep -Eoi "^((([a-f0-9]{2}:){5})|(([a-f0-9]{2}-){5}))[a-f0-9]{2}" | tr "-" ":")"
+		#删除 static_dhcp ;判断 mac 是否存在
+		static_dhcp_judge="$(uci show dhcp | sed -n 's/dhcp.\(@host\[[0-9]\+\]\).mac='\'$mac\''/\1/p')"
+		if [ -z "$static_dhcp_judge" ];then
+			del_error="${del_error};${macaddr}"
+			continue
+		else
+			uci delete dhcp.${static_dhcp_judge}
+			uci commit dhcp
+		fi
+	done
+	if [ -z "$del_error" ];then
+		json_init
+		json_add_string code "1"
+		json_add_string reason	"delete static_dhcp success"
+		json_add_string del_error	"$del_error"
+	else
+		json_init
+		json_add_string code "4"
+		json_add_string reason	"delete static_dhcp have error"
+		json_add_string del_error	"$del_error"
+	fi
+	echo -n "$(json_dump)"
+	(sleep 2;/etc/init.d/dnsmasq restart)&
+}
+
+get_disk(){
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"get_urlcap success"
+	json_add_array "data"
+	disk_data="$(df -hT | grep "/www/usb/")"
+	counter="$(echo "$disk_data" | wc -l)"
+	current_line=1
+	while [ "$current_line" -le "$counter" ] && [ -n "$disk_data" ];do
+	data_line="$(echo "$disk_data" | awk 'NR=="'"$current_line"'"{print $0}')"
+	disk_type="$(echo "$data_line" | awk '{print $2}')"
+	disk_size="$(echo "$data_line" | awk '{print $3}')"
+	disk_used="$(echo "$data_line" | awk '{print $4}')"
+	disk_available="$(echo "$data_line" | awk '{print $5}')"
+	disk_use_percent="$(echo "$data_line" | awk '{print $6}')"
+	disk_mounted="$(echo "$data_line" | awk '{print $7}')"
+	json_add_object
+	json_add_string disk_type "$disk_type"
+	json_add_string disk_size "$disk_size"
+	json_add_string disk_used "$disk_used"
+	json_add_string disk_available "$disk_available"
+	json_add_string disk_use_percent "$disk_use_percent"
+	json_add_string disk_mounted "$disk_mounted"
+	json_close_object
+	current_line="$((current_line+1))"
+	done
+	json_close_array
+	echo -n "$(json_dump)"
+}
+
+set_disk(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	json_load "$FORM_body"
+	json_select disk_mounted_list
+	index=1
+	while [ 1 ];do
+		json_get_var disk_mounted "${index}"
+		if [ -z "$disk_mounted" ];then
+			break
+		else
+			umount "$disk_mounted"
+			rm "$disk_mounted" -r
+			index="$((index+1))"
+		fi
+	done
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set_disk success"
+	echo -n "$(json_dump)"
+}
+
+get_cloud_login(){
+        status="$(my_uci_get anyos.cloud_weblogin.status)"
+        switch="$(my_uci_get anyos.cloud_weblogin.switch)"
+        if [ "$status" != "1" ];then
+                status=0
+        fi
+		if [ "$switch" != "1" ];then
+                switch=0
+        fi
+
+        ngrokid="$(my_uci_get anyos.cloud_weblogin.login_id)"
+	ngserver="$(my_uci_get anyos.cloud_weblogin.ngrokc_host)"
+	[ -z "$ngserver" ] && ngserver="$(my_uci_get anyos.server.server_mqtt_host)"
+	ngrport="$(my_uci_get anyos.cloud_weblogin.ngrokc_rport)"
+	if [ "$switch" == "0" ];then
+		ngrokurl=""
+	else
+		if [ "$ngrport" == "" ];then
+			ngrport="81"
+		fi
+		ngrokurl="http://${ngrokid}.${ngserver}:${ngrport}"
+	fi
+
+        json_init
+        json_add_string code "1"
+        json_add_string reason "get cloud login success"
+        json_add_string ngrokid "$ngrokid"
+        json_add_string ngrokurl "$ngrokurl"
+        json_add_string status "$status"
+        json_add_string switch "$switch"
+
+        echo -n "$(json_dump)"
+}
+
+set_cloud_login(){
+	token="$FORM_access_token"
+	switch="$FORM_switch"
+
+	check_token "$token"
+	if [ "$?" != "0" ];then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	uci set anyos.cloud_weblogin.switch="$switch"
+	uci commit anyos
+	/usr/sbin/anywifi/crond.d/S99_check_ngrokc &
+	. /usr/sbin/anywifi/anyos/uplink_interface
+	reportNgrokId
+	sleep 1
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set cloud switch success"
+	echo -n "$(json_dump)"
+}
+
+get_ac_info(){
+	device_owner="$(my_uci_get anyos.cloude_manage.device_owner)"
+	device_desc="$(my_uci_get anyos.cloude_manage.device_desc)"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get ac account success"
+	json_add_string device_owner "$device_owner"
+	json_add_string device_desc "$device_desc"
+
+	echo -n "$(json_dump)"
+}
+
+set_ac_info(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	device_owner="$FORM_device_owner"
+	device_desc="$FORM_device_desc"
+
+	uci set anyos.cloude_manage.device_owner="$device_owner"
+	uci set anyos.cloude_manage.device_desc="$device_desc"
+	uci commit anyos
+	. /usr/sbin/anywifi/anyos/uplink_interface
+	reportOwnship
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set ac info success"
+
+	echo -n "$(json_dump)"
+}
+
+get_ac_switch(){
+	ac_switch="$(my_uci_get anyos.cloude_manage.ac_switch)"
+	[ -z "$ac_switch" ] && ac_switch=1
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get ac switch success"
+	json_add_string ac_switch "$ac_switch"
+	echo -n "$(json_dump)"
+}
+
+set_ac_switch(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	ac_switch="$FORM_ac_switch"
+	uci set anyos.cloude_manage.ac_switch="$ac_switch"
+	uci commit anyos
+	[ -f /usr/sbin/anywifi/crond.d/S99_check_mqtt_server ] && /usr/sbin/anywifi/crond.d/S99_check_mqtt_server >/dev/null 2>&1
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set ac switch success"
+
+	echo -n "$(json_dump)"
+}
+
+activate_ngrokc(){
+	token="$FORM_access_token"
+	check_token "$token"
+	if [ "$?" != "0" ];then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	killall ngrokc
+	/usr/sbin/anywifi/crond.d/S99_check_ngrokc > /dev/null &
+	sleep 1
+	json_init
+	json_add_string code "1"
+	json_add_string reason "activate ngrokc success"
+	echo -n "$(json_dump)"
+}
+
+get_voice(){
+	voice_gpio="$(my_uci_get anyos.voice.voice_gpio)"
+	voice_status="$(my_uci_get anyos.voice.voice_status)"
+	voice_status="$((voice_status ^ 0))"
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get_voice status success"
+	json_add_string voice_status "$voice_status"
+	echo -n "$(json_dump)"
+}
+
+set_voice(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	json_load "$FORM_body"
+	json_get_var voice_status voice_status
+	voice_status="$((voice_status ^ 0))"
+	voice_gpio="$(my_uci_get anyos.voice.voice_gpio)"
+	voice_info="$(my_uci_get anyos.voice)"
+	if [ -z "$voice_info" ];then
+		uci set anyos.voice="info"
+	fi
+	uci set anyos.voice.voice_status="$voice_status"
+	uci commit anyos
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set_voice status success"
+	echo -n "$(json_dump)"
+	(/etc/init.d/any_voice restart) &
+}
+
+sysupgrade_upload_file(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	[ -f /tmp/firmware.bin ] && rm /tmp/firmware.bin
+	json_init
+	if [ -n "$FORM_firmware_path" ]; then
+		mv "$FORM_firmware_path" /tmp/firmware.bin
+		ret="$(sysupgrade --test /tmp/firmware.bin)"
+		if [ "$?" != 0 ];then
+			rm /tmp/firmware.bin
+			json_add_string code "-4"
+			json_add_string reason "File not a valid image and will be deleted"
+		else
+			json_add_string code "1"
+			json_add_string reason "file upload success"
+		fi
+	else
+		json_add_string code "-6"
+		json_add_string reason "file upload failed"
+	fi
+
+	echo -n "$(json_dump)"
+}
+
+url_upgrade(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	[ -f /tmp/url_upgrade.bin ] && rm /tmp/url_upgrade.bin
+	json_load "$FORM_body"
+	json_get_var save_upgrade save_upgrade
+	json_get_var os_url os_url
+	curl --connect-timeout 6 -kLo /tmp/url_upgrade.bin "$os_url" 2>/dev/null
+	ret_curl=$?
+
+	if [ ! -f /tmp/url_upgrade.bin ] || [ "$ret_curl" != 0 ];then
+		json_init
+		json_add_string code "-6"
+		json_add_string reason "not download url_upgrade.bin"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	ret="$(sysupgrade --test /tmp/url_upgrade.bin)"
+	if [ "$?" != 0 ];then
+		rm /tmp/url_upgrade.bin
+		code="-4"
+		reason="File not a valid image and will be deleted"
+	else
+		code="1"
+		reason="file upload success"
+	fi
+
+	json_init
+	json_add_string code "$code"
+	json_add_string reason "$reason"
+	echo -n "$(json_dump)"
+	touch /tmp/sysupgrade_lock
+	if [ "$save_upgrade" == "1" ];then
+		rm /etc/config/anyversion
+		sysupgrade /tmp/url_upgrade.bin &
+	else
+		sysupgrade -n /tmp/url_upgrade.bin &
+	fi
+}
+
+sysupgrade_execute(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	body="$FORM_body"
+	json_load    "$body"
+	json_get_var save_upgrade "save_upgrade"
+
+	json_init
+	if [ -f /tmp/firmware.bin ];then
+		json_add_string code "1"
+		json_add_string reason "start to upgrade"
+		echo -n "$(json_dump)"
+		touch /tmp/sysupgrade_lock
+		if [ "$save_upgrade" == "1" ];then
+			rm /etc/config/anyversion
+			sysupgrade /tmp/firmware.bin &
+		else
+			sysupgrade -n /tmp/firmware.bin &
+		fi
+	else
+		json_add_string code "-4"
+		json_add_string reason "firmware not found,please upload first"
+	    echo -n "$(json_dump)"
+	fi
+}
+
+#ONLINE_UPGRADE
+online_upgrade_check(){
+	board="$(my_uci_get anyversion.device.device_model_displayname)"
+	if [ -z "$board" ];then
+		board="$(my_uci_get anyversion.device.device_model)"
+	fi
+	sysversion="$(my_uci_get anyversion.device.device_version)"
+
+	request_url="$(my_uci_get anyversion.device.server_url)"
+	request_url="${request_url}/${board}/${sysversion}"
+	ret="$(curl -Lk "$request_url" --connect-timeout 3 -o - 2>/dev/null)"
+
+	test=$(json_load "$ret" 2>&1 | grep "Failed" | wc -l)
+	if [[ "$test" == "1" ]];then
+		json_init
+		json_add_string code "-4"
+		json_add_string reason "network failed"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	json_load "$ret"
+	json_get_var code code
+
+	if [ "$code" = "1" ];then
+		reason="have new version:$version"
+		json_select data
+		json_get_var version version
+		json_get_var url url
+		echo "$url" > /tmp/online_upgrade_url.txt
+	else
+		code="-6"
+		json_get_var reason reason
+	fi
+
+	json_init
+	json_add_string code "$code"
+	json_add_string reason "$reason"
+	json_add_string online_version "$version"
+	echo -n "$(json_dump)"
+}
+
+online_upgrade_apply(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	[ -f /tmp/online_upgrade.bin ] && rm /tmp/online_upgrade.bin
+	[ -f /tmp/online_upgrade_url.txt ] && online_url="$(cat /tmp/online_upgrade_url.txt)"
+	curl -kLo /tmp/online_upgrade.bin "$online_url" 2>/dev/null
+	json_load "$FORM_body"
+	json_get_var save_upgrade save_upgrade
+
+	if [ ! -f /tmp/online_upgrade.bin ];then
+		json_init
+		json_add_string code "-6"
+		json_add_string reason "not download online_upgrade.bin"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	ret="$(sysupgrade --test /tmp/online_upgrade.bin)"
+	if [ "$?" != 0 ];then
+		rm /tmp/online_upgrade.bin
+		code="-4"
+		reason="File not a valid image and will be deleted"
+	else
+		code="1"
+		reason="file upload success"
+	fi
+
+	json_init
+	json_add_string code "$code"
+	json_add_string reason "$reason"
+	echo -n "$(json_dump)"
+	touch /tmp/sysupgrade_lock
+	if [ "$save_upgrade" == "1" ];then
+		rm /etc/config/anyversion
+		sysupgrade /tmp/online_upgrade.bin &
+	else
+		sysupgrade -n /tmp/online_upgrade.bin &
+	fi
+}
+
+sysupgrade_backup(){
+	check_token "$FORM_access_token"
+	backup_path="/backup.tar.gz"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ -f "/www/$backup_path" ];then
+		rm "/www/$backup_path"
+	fi
+
+	[ -e /tmp/back ] && rm /tmp/back -r
+	mkdir /tmp/back
+	sysupgrade -b "/tmp/${backup_path}" 1>/dev/null
+	if [ "$?" != "0" ];then
+		json_init
+		json_add_string code "-4"
+		json_add_string reason "sysupgrade backup failed"
+		echo -n "$(json_dump)"
+		return
+	fi
+	tar -xzvf /tmp/${backup_path} -C /tmp/back/ 2>/dev/null 1>/dev/null
+	rm /tmp/back/etc/config/anyversion
+	uci -qc /tmp/back/etc/config delete network.lan_dev.macaddr
+	uci -qc /tmp/back/etc/config delete network.wan_dev.macaddr
+	uci -c /tmp/back/etc/config commit network
+	cd /tmp/back 2>/dev/null 1>/dev/null
+	tar -czvf /www/${backup_path} * 2>/dev/null 1>/dev/null
+	cd - 2>/dev/null 1>/dev/null
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "sysupgrade backup success"
+	json_add_string backup_path "$backup_path"
+	echo -n "$(json_dump)"
+
+}
+
+sysupgrade_backup_upload(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	json_init
+	if [ -n "$FORM_firmware_path" ]; then
+		mv $FORM_firmware_path /tmp/backup.tar.gz
+		code="1"
+		reason="file upload success"
+	else
+		code="-6"
+		reason="file upload failed"
+		json_init
+		json_add_string code "$code"
+		json_add_string reason "$reason"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	sysupgrade -b /tmp/old_bakcup.tar.gz 2>/dev/null 1>/dev/null
+	sysupgrade -r /tmp/backup.tar.gz
+	ret="$?"
+	if [ "$ret" == 0 ];then
+		sysupgrade -r /tmp/old_bakcup.tar.gz
+	else
+		code="-4"
+		reason="backup no .tar.gz,please upload again"
+	fi
+	rm /tmp/old_bakcup.tar.gz
+
+	json_init
+	json_add_string code "$code"
+	json_add_string reason "$reason"
+	echo -n "$(json_dump)"
+}
+
+sysupgrade_backup_execute(){
+	json_load "$FORM_body"
+	json_get_var access_token access_token
+	access_token="$FORM_access_token"
+
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	json_init
+	sysupgrade -r /tmp/backup.tar.gz
+	ret="$?"
+	if [ "$ret" == 0 ];then
+		json_add_string code "1"
+		json_add_string reason "start to upgrade"
+		echo -n "$(json_dump)"
+		log_content="sys:\"system restore configuration\""
+		log_write "$log_content"
+		reboot
+	else
+		json_add_string code "-4"
+		json_add_string reason "backup no .tar.gz,please upload again"
+		echo -n "$(json_dump)"
+	fi
+}
+
+sys_reset(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	json_init
+	json_add_string code "1"
+	json_add_string reason "begin to reset"
+	echo -n "$(json_dump)"
+	touch /tmp/sysupgrade_lock
+	sleep 1
+	(rm -rf /overlay/*; reboot) &
+}
+
+get_ntp(){
+	ENABLE_NTP_SERVER="$(my_uci_get system.ntp.enable_server)"
+	ENABLE_NTP_CLIENT="$(my_uci_get system.ntp.enabled)"
+	SERVER_PRIMARY="$(my_uci_get system.ntp.server | awk '{print $1}')"
+	SERVER_SECONDARY="$(my_uci_get system.ntp.server | awk '{print $2}')"
+	timezone="$(my_uci_get system.@system[0].timezone | grep -oE "GMT\-[0-9]+|GMT\+[0-9]+" | grep -v "\-0")"
+	[ -z "$timezone" ] && timezone="$(uci get system.@system[0].timezone)"
+	timezone_list="$(find /usr/share/zoneinfo/GMT* | grep -oE "\-[0-9]+|\+[0-9]+" | grep -v "\-0" | sort -n)"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get ntp success"
+	json_add_string enable_ntp_server "$ENABLE_NTP_SERVER"
+	json_add_string enable_ntp_client "$ENABLE_NTP_CLIENT"
+	json_add_string server_primary "$SERVER_PRIMARY"
+	json_add_string server_secondary "$SERVER_SECONDARY"
+	json_add_string timezone "$timezone"
+	json_add_array "timezone_list"
+	for timezone_tmp in $timezone_list
+	do
+		json_add_string timezone_tmp "GMT${timezone_tmp}"
+	done
+	json_close_array
+
+	echo -n "$(json_dump)"
+}
+
+set_ntp(){
+	body="$FORM_body"
+	access_token="$FORM_access_token"
+	json_load "$body"
+	json_get_var enable_ntp_server enable_ntp_server
+	json_get_var enable_ntp_client enable_ntp_client
+	json_get_var server_primary server_primary
+	json_get_var server_secondary server_secondary
+	json_get_var timezone timezone
+
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	timezone="$(echo "$timezone" | grep -oE "GMT\-[0-9]+|GMT\+[0-9]+" | grep -v "\-0")"
+	if [ -n "$timezone" ];then
+		uci set system.@system[0].timezone="${timezone}"
+		uci set system.@system[0].zonename="${timezone}"
+	fi
+
+	uci set system.ntp.enable_server="$enable_ntp_server"
+	uci set system.ntp.enabled="$enable_ntp_client"
+
+	uci -q delete system.ntp.server
+	uci add_list system.ntp.server="$server_primary"
+	uci add_list system.ntp.server="$server_secondary"
+	reason="set ntp success"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "$reason"
+	echo -n "$(json_dump)"
+
+	uci commit system
+
+	(/etc/init.d/system restart) &
+	(/etc/init.d/sysntpd restart) &
+}
+
+sys_reboot(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	json_init
+	json_add_string code "1"
+	json_add_string reason "begin to reboot"
+	echo -n "$(json_dump)"
+	log_content="sys:\"reboot system\""
+	log_write "$log_content"
+	reboot
+}
+
+get_sys_version(){
+	sysversion="$(my_uci_get anyversion.device.device_version)"
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get sysversion success"
+	json_add_string sysversion "$sysversion"
+
+	echo -n "$(json_dump)"
+}
+
+getAutoreboot(){
+	enabled="$(my_uci_get autoreboot.main.enabled)"
+	hour="$(my_uci_get autoreboot.main.hour)"
+	minute="$(my_uci_get autoreboot.main.minute)"
+	weekdays="$(my_uci_get autoreboot.main.weekdays)"
+	[ "$enabled" == 1 ] || enabled=0
+	json_init
+	json_add_string code "1"
+	json_add_string reason "getAutoreboot success"
+	json_add_string enabled "$enabled"
+	json_add_string hour "$hour"
+	json_add_string minute "$minute"
+	json_add_string weekdays "$weekdays"
+	echo -n "$(json_dump)"
+}
+
+setAutoreboot(){
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	json_load "$FORM_body"
+	json_get_var enabled enabled
+	json_get_var hour hour
+	json_get_var minute minute
+	json_get_var weekdays weekdays
+	enabled="$((enabled ^ 0))"
+	hour="$(echo "$hour" | awk '/^([0-2][0-3]|[0-9]|1[0-9])$/ {printf("%02d\n",$0)}')"
+	minute="$(echo "$minute" | awk '/^([0-5][0-9]|[0-9])$/ {printf("%02d\n",$0)}')"
+
+	if [ -z "$hour" ];then
+		json_init
+		json_add_string code "2"
+		json_add_string reason "setAutoreboot hour shoud 0-23"
+		echo -n "$(json_dump)"
+		return
+	fi
+	if [ -z "$minute" ];then
+		json_init
+		json_add_string code "2"
+		json_add_string reason "setAutoreboot minute shoud 0-59"
+		echo -n "$(json_dump)"
+		return
+	fi
+	uci set autoreboot.main.enabled="$enabled"
+	uci set autoreboot.main.hour="$hour"
+	uci set autoreboot.main.minute="$minute"
+	uci set autoreboot.main.weekdays="$weekdays"
+	uci commit autoreboot
+	json_init
+	json_add_string code "1"
+	json_add_string reason "setAutoreboot success"
+	echo -n "$(json_dump)"
+}
+
+#系统工具
+test_ping(){
+	host="$FORM_host"
+	ipversion="$FORM_ipversion"
+	if [ -z "$host" ]; then
+		json_init
+		json_add_string code "2"
+		json_add_string reason "need ping host param"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ -z "$ipversion" ]; then
+		ipversion=4
+	fi
+
+	json_init
+	json_add_string code "1"
+	pingret="$(ping -${ipversion} -c 4 $FORM_host 2>&1)"
+	if [ "$?" != "0" ];then
+		reason="ipv${ipversion} ping test failed"
+	fi
+
+	if [ "$(echo $pingret | grep "0% packet loss" | wc -l)" == 1 ];then
+		reason="ipv${ipversion} ping test success"
+	else
+		reason="ipv${ipversion} ping test failed"
+	fi
+
+
+	json_add_string reason "$reason"
+	json_add_string data "$pingret"
+
+	echo -n "$(json_dump)"
+}
+
+test_nslookup(){
+	host="$1"
+	if [ -z "$host" ]; then
+		json_init
+		json_add_string code "2"
+		json_add_string reason "need nslookup host param"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	json_init
+	json_add_string code "1"
+	nslookupret="$(nslookup $host 2>&1)"
+	if [ "$?" != "0" ];then
+		reason="nslookup test failed"
+	fi
+
+	if [ "$(echo "$nslookupret" | grep "server can't find")" ];then
+		reason="nslookup test failed"
+	else
+		reason="nslookup test success"
+	fi
+
+	json_add_string reason "$reason"
+	json_add_string data "$nslookupret"
+
+	echo -n "$(json_dump)"
+}
+
+test_traceroute(){
+	host="$1"
+	ipversion="$2"
+	if [ -z "$host" ]; then
+		json_init
+		json_add_string code "2"
+		json_add_string reason "need traceroute host param"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ -z "$ipversion" ]; then
+		ipversion=4
+	fi
+
+	json_init
+	json_add_string code "1"
+	trace_data="$(traceroute -$ipversion -m 5 $host 2>&1)"
+	if [ "$?" != "0" ];then
+		reason="ipv${ipversion} traceroute test failed"
+	fi
+
+	if [ "$trace_data" == "" ];then
+		reason="ipv${ipversion} traceroute test failed"
+	else
+		reason="ipv${ipversion} traceroute test success"
+	fi
+
+	json_add_string reason "$reason"
+	json_add_string data "$trace_data"
+
+	echo -n "$(json_dump)"
+}
+
+test_wget(){
+	host="$1"
+	ipversion="$FORM_ipversion"
+	if [ -z "$host" ]; then
+		json_init
+		json_add_string code "2"
+		json_add_string reason "need wget host param"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ -z "$ipversion" ]; then
+		ipversion=4
+	fi
+
+	wget_ret="$(wget -$ipversion -O /dev/null http://$host 2>&1)"
+
+	json_init
+	json_add_string code "1"
+	if [ -z "$wget_ret" ]; then
+		reason="wget ipv$ipversion test failed"
+	else
+		reason="wget ipv$ipversion test success"
+	fi
+
+	json_add_string reason "$reason"
+	json_add_string data "$wget_ret"
+
+	echo -n "$(json_dump)"
+}
+
+site_survey(){
+	json_init
+	json_add_array "data"
+	wifimode="$FORM_wifimode"
+
+	if [ "$wifimode" == 5 ];then
+		wifi_interface=rai0
+		wifi_device="$(my_uci_get anyos.wifi.wifi5_device)"
+	else
+		wifi_interface=ra0
+	fi
+
+	iwpriv $wifi_interface set SiteSurvey=
+	touch /tmp/site_survey_lock
+	sleep 6
+	if [ "$wifi_device" == mt7663 ];then
+		iw_date="$(iwpriv $wifi_interface get_site_survey | sed '1,3d' | sed '$d'| awk '{$1="";print $0}')"
+	else
+		iw_date="$(iwpriv $wifi_interface get_site_survey | sed '1,2d' | sed '$d')"
+	fi
+	counter="$(echo "$iw_date" | wc -l)"
+	current_line=1
+	while [ "$current_line" -le "$counter" ] && [ -n "$iw_date" ];do
+		date_line="$(echo "$iw_date" | awk 'NR=="'"$current_line"'"{print $0}')"
+		head_part="$(echo "$date_line" | sed -En 's/(.*)(((([a-f0-9]{2}:){5})|(([a-f0-9]{2}-){5}))[a-f0-9]{2}.*)/\1/p')"
+		end_part="$(echo "$date_line" | sed -En 's/(.*)(((([a-f0-9]{2}:){5})|(([a-f0-9]{2}-){5}))[a-f0-9]{2}.*)/\2/p')"
+		channel="$(echo "$head_part" | awk '{print $1}')"
+		ssid="$(echo "$head_part" | awk 'BEGIN{ORS=" "} {for(i=2;i<=NF;i++) print $i}' | sed 's/[ \t]*$//g')"
+		bssid="$(echo "$end_part" | awk '{print $1}')"
+		enc="$(echo "$end_part" | awk '{print $2}')"
+		signal="$(echo "$end_part" | awk '{print $3}')"
+		[ -z "$signal" ] && signal=0
+		json_add_object
+		json_add_string ssid "$ssid"
+		json_add_string bssid "$bssid"
+		json_add_string channel "$channel"
+		json_add_string signal "$signal"
+		json_add_string enc "$enc"
+		json_close_object
+		current_line="$((current_line+1))"
+	done
+
+	json_close_array
+	rm /tmp/site_survey_lock
+	json_add_string code "1"
+	json_add_string reason "wifi scan success"
+	echo -n "$(json_dump)"
+}
+
+search_day(){
+	OEN_DAY_SEC="86400"
+	now_date="$(date "+%Y-%m-%d")"
+	today_begin_sec="$(date -d "$now_date 00:00:00" +%s)"
+	local offset="$1"
+	local day_range="$2"
+	local search_begin_sec="$((today_begin_sec - OEN_DAY_SEC * offset))"
+	local search_end_sec="$((search_begin_sec + OEN_DAY_SEC * day_range))"
+
+	echo "$search_begin_sec $search_end_sec"
+}
+
+get_days_traffic(){
+	DAYS_TRAFFIC_PATH="/usr/sbin/anywifi/days_traffic"
+	json_init
+	json_add_string code "1"
+	json_add_string reason "search_day traffic"
+
+	search_day_line="$(search_day "6" "7")"
+	search_day_head="$(echo "$search_day_line" | awk '{print $1}')"
+	search_day_end="$(echo "$search_day_line" | awk '{print $2}')"
+
+	debug_echo "search_day_head=$search_day_head"
+	debug_echo "search_day_end=$search_day_end"
+	debug_echo "search_day_head = $(date -d @${search_day_head} "+%Y-%m-%d")"
+	debug_echo "search_day_end = $(date -d @${search_day_end} "+%Y-%m-%d")"
+
+	if [ -e "$DAYS_TRAFFIC_PATH/lan" ];then
+		search_day_lan_up="$(cat "$DAYS_TRAFFIC_PATH/lan" | awk -v tmp=0 'END{print tmp} {if($1>="'"$search_day_head"'" && $1<"'"$search_day_end"'"){tmp+=$5}}')"
+		search_day_lan_down="$(cat "$DAYS_TRAFFIC_PATH/lan" | awk -v tmp=0 'END{print tmp} {if($1>="'"$search_day_head"'" && $1<"'"$search_day_end"'"){tmp+=$7}}')"
+		lan_log="$(cat "$DAYS_TRAFFIC_PATH/lan")"
+	else
+		search_day_lan_up=0
+		search_day_lan_down=0
+		lan_log=""
+	fi
+	if [ -e "$DAYS_TRAFFIC_PATH/wan" ];then
+		search_day_wan_up="$(cat "$DAYS_TRAFFIC_PATH/wan" | awk -v tmp=0 'END{print tmp} {if($1>="'"$search_day_head"'" && $1<"'"$search_day_end"'"){tmp+=$5}}')"
+		search_day_wan_down="$(cat  "$DAYS_TRAFFIC_PATH/wan" | awk -v tmp=0 'END{print tmp} {if($1>="'"$search_day_head"'" && $1<"'"$search_day_end"'"){tmp+=$7}}')"
+		wan_log="$(cat "$DAYS_TRAFFIC_PATH/wan")"
+	else
+		search_day_wan_up=0
+		search_day_wan_down=0
+		wan_log=""
+	fi
+	json_add_string lan_log  "$lan_log"
+	json_add_string search_day_lan_up  "$search_day_lan_up"
+	json_add_string search_day_lan_down  "$search_day_lan_down"
+
+	json_add_string wan_log  "$wan_log"
+	json_add_string search_day_wan_up  "$search_day_wan_up"
+	json_add_string search_day_wan_down  "$search_day_wan_down"
+
+	module_list="$(find /usr/sbin/anywifi/days_traffic | grep -wo "4gwan.*")"
+	json_add_array "module"
+	for module in $module_list
+	do
+		json_add_object
+		search_day_module_up="$(cat "$DAYS_TRAFFIC_PATH/${module}" | awk -v tmp=0 'END{print tmp} {if($1>="'"$search_day_head"'" && $1<"'"$search_day_end"'"){tmp+=$5}}')"
+		search_day_module_down="$(cat "$DAYS_TRAFFIC_PATH/${module}" | awk -v tmp=0 'END{print tmp} {if($1>="'"$search_day_head"'" && $1<"'"$search_day_end"'"){tmp+=$7}}')"
+		module_log="$(cat "$DAYS_TRAFFIC_PATH/${module}")"
+		json_add_string module  "$module"
+		json_add_string module_log  "$module_log"
+		json_add_string search_day_module_up  "$search_day_module_up"
+		json_add_string search_day_module_down  "$search_day_module_down"
+		json_close_object
+	done
+	json_close_array
+	echo -n  "$(json_dump)"
+}
+
+refresh_days_traffic(){
+	body="$FORM_body"
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	[ -e "/usr/sbin/anywifi/crond.d/traffic_collect__30" ] && /usr/sbin/anywifi/crond.d/traffic_collect__30
+	json_init
+	json_add_string code "1"
+	json_add_string reason "refresh_days_traffic success"
+	echo -n "$(json_dump)"
+}
+
+#VPN
+get_pptp_status(){
+	pptp_ifconfig="$(ifconfig pptp-pptp)"
+	pptp_ip="$(echo "$pptp_ifconfig" | grep "inet addr" | awk -F ':' '{print $2}' | awk '{print $1}')"
+	pptp_rx="$(echo "$pptp_ifconfig" | grep "RX bytes" | awk '{print $2}' | awk -F ':' '{print $2}')"
+	pptp_tx="$(echo "$pptp_ifconfig" | grep "RX bytes" | awk '{print $6}' | awk -F ':' '{print $2}')"
+
+	pptp_ubus_data="$(ubus call network.interface.pptp status)"
+	json_load "$pptp_ubus_data"
+	json_get_var pptp_uptime uptime
+	json_init
+	json_add_string pptp_ip "$pptp_ip"
+	json_add_string pptp_rx "$pptp_rx"
+	json_add_string pptp_tx "$pptp_tx"
+	json_add_string pptp_uptime "$pptp_uptime"
+
+	echo -n "$(json_dump)"
+}
+
+get_pptp_config(){
+	proto="$(my_uci_get anyos_pptp.pptp.proto)"
+	server="$(my_uci_get anyos_pptp.pptp.server)"
+	username="$(my_uci_get anyos_pptp.pptp.username)"
+	password="$(my_uci_get anyos_pptp.pptp.password)"
+	defaultroute="$(my_uci_get anyos_pptp.pptp.defaultroute)"
+	enabled="$(my_uci_get anyos_pptp.pptp.enabled)"
+
+	[ "$defaultroute" != 1 ] && defaultroute=0
+	[ "$enabled" != 1 ] && enabled=0
+
+	json_init
+	json_add_string proto   "$proto"
+	json_add_string server  "$server"
+	json_add_string username "$username"
+	json_add_string password "$password"
+	json_add_string defaultroute "$defaultroute"
+	json_add_string enabled "$enabled"
+
+	echo -n "$(json_dump)"
+}
+
+set_pptp_config(){
+	body="$FORM_body"
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	json_load "$body"
+	json_get_var proto proto
+	json_get_var server server
+	json_get_var username username
+	json_get_var password password
+	json_get_var defaultroute defaultroute
+	json_get_var enabled enabled
+
+	[ -e "$anyos_pptp" ] || touch /etc/config/anyos_pptp
+	uci set anyos_pptp.pptp=interface
+	uci set anyos_pptp.pptp.proto="$proto"
+	uci set anyos_pptp.pptp.server="$server"
+	uci set anyos_pptp.pptp.username="$username"
+	uci set anyos_pptp.pptp.password="$password"
+	uci set anyos_pptp.pptp.defaultroute="$defaultroute"
+	uci set anyos_pptp.pptp.enabled="$enabled"
+
+	uci set network.pptp=interface
+	uci set network.pptp.proto="$proto"
+	uci set network.pptp.server="$server"
+	uci set network.pptp.username="$username"
+	uci set network.pptp.password="$password"
+	uci set network.pptp.defaultroute="$defaultroute"
+	uci set network.pptp.enabled="$enabled"
+	[ "$enabled" == 0 ] && uci delete network.pptp
+	uci commit anyos_pptp
+	uci commit network
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason  "set pptp success"
+
+	echo -n "$(json_dump)"
+	(ifup pptp) &
+}
+
+get_l2tp_status(){
+	l2tp_ifconfig="$(ifconfig l2tp-l2tp)"
+	l2tp_ip="$(echo "$l2tp_ifconfig" | grep "inet addr" | awk -F ':' '{print $2}' | awk '{print $1}')"
+	l2tp_rx="$(echo "$l2tp_ifconfig" | grep "RX bytes" | awk '{print $2}' | awk -F ':' '{print $2}')"
+	l2tp_tx="$(echo "$l2tp_ifconfig" | grep "RX bytes" | awk '{print $6}' | awk -F ':' '{print $2}')"
+
+	l2tp_ubus_data="$(ubus call network.interface.l2tp status)"
+	json_load "$l2tp_ubus_data"
+	json_get_var l2tp_uptime uptime
+	json_init
+	json_add_string l2tp_ip "$l2tp_ip"
+	json_add_string l2tp_rx "$l2tp_rx"
+	json_add_string l2tp_tx "$l2tp_tx"
+	json_add_string l2tp_uptime "$l2tp_uptime"
+
+	echo -n "$(json_dump)"
+}
+
+get_l2tp_config(){
+	proto="$(my_uci_get anyos_l2tp.l2tp.proto)"
+	server="$(my_uci_get anyos_l2tp.l2tp.server)"
+	username="$(my_uci_get anyos_l2tp.l2tp.username)"
+	password="$(my_uci_get anyos_l2tp.l2tp.password)"
+	defaultroute="$(my_uci_get anyos_l2tp.l2tp.defaultroute)"
+	enabled="$(my_uci_get anyos_l2tp.l2tp.enabled)"
+	[ "$defaultroute" != 1 ] && defaultroute=0
+	[ "$enabled" != 1 ] && enabled=0
+
+	json_init
+	json_add_string proto   "$proto"
+	json_add_string server "$server"
+	json_add_string username "$username"
+	json_add_string password "$password"
+	json_add_string defaultroute "$defaultroute"
+	json_add_string enabled "$enabled"
+	echo -n "$(json_dump)"
+}
+
+set_l2tp_config(){
+	body="$FORM_body"
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	json_load "$body"
+	json_get_var proto proto
+	json_get_var server server
+	json_get_var username username
+	json_get_var password password
+	json_get_var defaultroute defaultroute
+	json_get_var enabled enabled
+
+	[ -e "$anyos_l2tp" ] || touch /etc/config/anyos_l2tp
+	uci set anyos_l2tp.l2tp=interface
+	uci set anyos_l2tp.l2tp.proto="$proto"
+	uci set anyos_l2tp.l2tp.server="$server"
+	uci set anyos_l2tp.l2tp.username="$username"
+	uci set anyos_l2tp.l2tp.password="$password"
+	uci set anyos_l2tp.l2tp.defaultroute="$defaultroute"
+	uci set anyos_l2tp.l2tp.enabled="$enabled"
+
+	uci set network.l2tp=interface
+	uci set network.l2tp.proto="$proto"
+	uci set network.l2tp.server="$server"
+	uci set network.l2tp.username="$username"
+	uci set network.l2tp.password="$password"
+	uci set network.l2tp.defaultroute="$defaultroute"
+	uci set network.l2tp.enabled="$enabled"
+	[ "$enabled" == 0 ] && uci delete network.l2tp
+	uci commit anyos_l2tp
+	uci commit network
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set l2tp success"
+
+	echo -n "$(json_dump)"
+	(ifup l2tp) &
+}
+
+get_openvpn_msg(){
+	enabled="$(my_uci_get openvpn.sample_client.enabled)"
+	[ -z "$enabled" ] && enabled=0
+	remote="$(my_uci_get openvpn.sample_client.remote)"
+	port="$(my_uci_get openvpn.sample_client.port)"
+	[ -z "$port" ] && port=1194
+	dev_type="$(my_uci_get openvpn.sample_client.dev_type)"
+	[ -z "$dev_type" ] && dev_type=tun
+	proto="$(my_uci_get openvpn.sample_client.proto)"
+	client="$(my_uci_get openvpn.sample_client.client)"
+	nobind="$(my_uci_get openvpn.sample_client.nobind)"
+	verb="$(my_uci_get openvpn.sample_client.verb)"
+	comp_lzo="$(my_uci_get openvpn.sample_client.comp_lzo)"
+
+	ca="$(cat /etc/openvpn/ca.crt)"
+	cert="$(cat /etc/openvpn/client.crt)"
+	key="$(cat /etc/openvpn/client.key)"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get openvpn msg success"
+	json_add_string enabled "$enabled"
+	json_add_string remote  "$remote"
+	json_add_string port	"$port"
+	json_add_string dev_type "$dev_type"
+	json_add_string proto	"$proto"
+	json_add_string client	"$client"
+	json_add_string nobind	"$nobind"
+	json_add_string verb	"$verb"
+	json_add_string comp_lzo "$comp_lzo"
+
+	json_add_string ca      "$ca"
+	json_add_string cert    "$cert"
+	json_add_string key     "$key"
+
+	echo -n "$(json_dump)"
+}
+
+get_openvpn_status(){
+	openvpn_pid="$(ps | grep -w "/usr/sbin/openvpn" | grep -v grep | awk '{print $1}')"
+	if [ -z "$openvpn_pid" ];then
+		openvpn_status=0
+	else
+		openvpn_status=1
+	fi
+
+	json_init
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get openvpn status success"
+	json_add_string openvpn_status "$openvpn_status"
+	echo -n "$(json_dump)"
+}
+
+
+set_openvpn(){
+	body="$FORM_body"
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	json_load "$body"
+	json_get_var enabled enabled
+	json_get_var remote remote
+	json_get_var port port
+	json_get_var dev_type dev_type
+	json_get_var proto proto
+	json_get_var client client
+	json_get_var nobind nobind
+	json_get_var verb verb
+	json_get_var comp_lzo comp_lzo
+
+	json_get_var ca ca
+	json_get_var cert cert
+	json_get_var key key
+
+	uci set openvpn.sample_client.enabled="$enabled"
+	uci set openvpn.sample_client.remote="$remote"
+	uci set openvpn.sample_client.port="$port"
+	uci set openvpn.sample_client.dev_type="$dev_type"
+	uci set openvpn.sample_client.proto="$proto"
+	uci set openvpn.sample_client.client="$client"
+	uci set openvpn.sample_client.nobind="$nobind"
+	uci set openvpn.sample_client.verb="$verb"
+	uci set openvpn.sample_client.comp_lzo="$comp_lzo"
+
+	uci set openvpn.sample_client.ca="/etc/openvpn/ca.crt"
+	uci set openvpn.sample_client.cert="/etc/openvpn/client.crt"
+	uci set openvpn.sample_client.key="/etc/openvpn/client.key"
+
+	uci commit openvpn
+
+	[ ! -d /etc/openvpn ] && mkdir /etc/openvpn
+	echo "${ca}" > /etc/openvpn/ca.crt
+	echo "${cert}" > /etc/openvpn/client.crt
+	echo "${key}" > /etc/openvpn/client.key
+
+	ret="$(my_uci_get network.lan.ifname)"
+	if [ "$enabled" == "1" ];then
+		ret_judge="$(echo "$ret" | grep "tap0" | wc -l)"
+		if [ "$ret_judge" != "1" ];then
+			ret="$ret tap0"
+			uci set network.lan.ifname="${ret}"
+		fi
+	else
+		tmp=""
+		for cell in $ret
+		do
+			if [ "$cell" != "tap0" ];then
+				if [ -n "$tmp" ];then
+					tmp="$tmp $cell"
+				else
+					tmp="$cell"
+				fi
+			fi
+		done
+		uci set network.lan.ifname="${tmp}"
+	fi
+	uci commit network
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set vpn success"
+	echo -n "$(json_dump)"
+
+	(sleep 2;/etc/init.d/openvpn restart)&
+	(sleep 3;/etc/init.d/network restart)&
+}
+
+get_n2n(){
+	# n2n_id="$FORM_n2n_id"
+	# n2n_list="$(cat /etc/config/network | grep "config interface" | sed -n 's/.*n2n\([0-9]\+\).*/\1/p')"
+
+	# n2n_judge="$(echo "$n2n_id" | tr -d '[0-9a-zA-Z_]')"
+	# if [ -n "$n2n_judge" ];then
+		# json_init
+		# json_add_string code "4"
+		# json_add_string reason "n2n_id need use 0-9, a-z, A-Z and _"
+		# json_add_array "n2n_list"
+		# for n2n_tmp in $n2n_list;do
+			# json_add_string n2n_tmp "$n2n_tmp"
+		# done
+		# json_close_array
+		# echo -n "$(json_dump)"
+		# return
+	# fi
+	n2n_list="$(uci show network | grep "proto='n2n'" | awk -F '.' '{print $2}')"
+	interface_list="$(uci show network | grep "=interface" | awk -F '.' '{print $2}' | awk -F '=' '{print $1}' | grep -v "loopback\|wan6")"
+	# if [ -z "$n2n_list" ];then
+		# json_init
+		# json_add_string code "2"
+		# json_add_string reason "not have n2n_list"
+		# json_add_array "n2n_list"
+		# for n2n_tmp in $n2n_list;do
+			# json_add_string n2n_tmp "$n2n_tmp"
+		# done
+		# json_close_array
+		# echo -n "$(json_dump)"
+		# return
+	# fi
+
+	# if [ -z "$n2n_id" ];then
+		# n2n_id="$(echo "$n2n_list" | sed -n 1p)"
+	# fi
+
+	# n2n_section_judge="$(echo "$n2n_list" | grep -w "$n2n_id")"
+	# if [ -z "$n2n_section_judge" ];then
+		# json_init
+		# json_add_string code "3"
+		# json_add_string reason "not have n2n_id section"
+		# json_add_array "n2n_list"
+		# for n2n_tmp in $n2n_list;do
+			# json_add_string n2n_tmp "$n2n_tmp"
+		# done
+		# json_close_array
+		# echo -n "$(json_dump)"
+		# return
+	# fi
+
+	# n2n_section="$n2n_id"
+	# json_add_array "data"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"n2n get success"
+	json_add_array "interface_list"
+	for interface_tmp in $interface_list;do
+		json_add_string interface_tmp "$interface_tmp"
+	done
+	json_close_array
+	json_add_array 'data'
+	for n2n_section in $n2n_list
+	do
+	server_ip="$(my_uci_get network.${n2n_section}.server)"
+	server_port="$(my_uci_get network.${n2n_section}.port)"
+	table="$(my_uci_get network.${n2n_section}.table)"
+	natip="$(my_uci_get network.${n2n_section}.natip)"
+	subnet_name="$(my_uci_get network.${n2n_section}.community)"
+	key="$(my_uci_get network.${n2n_section}.key)"
+	mode="$(my_uci_get network.${n2n_section}.mode)"
+	ip="$(my_uci_get network.${n2n_section}.ipaddr)"
+	subnetmask="$(my_uci_get network.${n2n_section}.netmask)"
+	gateway="$(my_uci_get network.${n2n_section}.gateway)"
+	auto="$(my_uci_get network.${n2n_section}.auto)"
+	[ -z "$auto" ] && auto=1
+
+	json_add_object
+	json_add_string server_ip   "$server_ip"
+	json_add_string server_port  "$server_port"
+	json_add_string table  "$table"
+	json_add_string natip  "$natip"
+	json_add_string subnet_name  "$subnet_name"
+	json_add_string key  "$key"
+	json_add_string mode  "$mode"
+	json_add_string ip  "$ip"
+	json_add_string subnetmask  "$subnetmask"
+	json_add_string gateway  "$gateway"
+	json_add_string auto  "$auto"
+	json_add_string n2n_name  "$n2n_section"
+	json_close_object
+	done
+	json_close_array
+
+	# json_add_array "n2n_list"
+	# for n2n_tmp in $n2n_list;do
+		# json_add_string n2n_tmp "$n2n_tmp"
+	# done
+	# json_close_array
+
+	echo -n "$(json_dump)"
+}
+
+get_n2n_status(){
+	n2n_name="$FORM_n2n_name"
+	if [ -z "$n2n_name" ];then
+		n2n_name="$(uci show network | grep "proto='n2n'" | awk -F '.' '{print $2}')"
+	fi
+
+	if [ -z "$n2n_name" ];then
+		n2n_ip=0.0.0.0
+		n2n_rx=0
+		n2n_tx=0
+		n2n_uptime=0
+		json_init
+		json_add_string n2n_ip "$n2n_ip"
+		json_add_string n2n_rx "$n2n_rx"
+		json_add_string n2n_tx "$n2n_tx"
+		json_add_string n2n_uptime "$n2n_uptime"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	n2n_ifconfig="$(ifconfig n2n-${n2n_name})"
+	n2n_ip="$(echo "$n2n_ifconfig" | grep "inet addr" | awk -F ':' '{print $2}' | awk '{print $1}')"
+	n2n_rx="$(echo "$n2n_ifconfig" | grep "RX bytes" | awk '{print $2}' | awk -F ':' '{print $2}')"
+	n2n_tx="$(echo "$n2n_ifconfig" | grep "RX bytes" | awk '{print $6}' | awk -F ':' '{print $2}')"
+
+	n2n_ubus_data="$(ubus call network.interface.${n2n_name} status)"
+	json_load "$n2n_ubus_data"
+	json_get_var pptp_uptime uptime
+	json_init
+	json_add_string n2n_ip "$n2n_ip"
+	json_add_string n2n_rx "$n2n_rx"
+	json_add_string n2n_tx "$n2n_tx"
+	json_add_string n2n_uptime "$n2n_uptime"
+
+	echo -n "$(json_dump)"
+}
+
+set_n2n(){
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	json_load "$FORM_body"
+	json_get_var server_ip server_ip
+	json_get_var server_port server_port
+	json_get_var table table
+	json_get_var natip natip
+	json_get_var subnet_name subnet_name
+	json_get_var key key
+	json_get_var mode mode
+	json_get_var ip ip
+	json_get_var subnetmask subnetmask
+	json_get_var gateway gateway
+	json_get_var auto auto
+	json_get_var n2n_delete n2n_delete
+	json_get_var n2n_name n2n_name
+	json_get_var n2n_name_old n2n_name_old
+
+	n2n_name_judge="$(echo "$n2n_name" | tr -d '[0-9a-zA-Z_]')"
+	if [ -n "$n2n_name_judge" ];then
+		json_init
+		json_add_string code "4"
+		json_add_string reason "n2n_name need use 0-9, a-z, A-Z and _"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	n2n_name_old_judge="$(echo "$n2n_name_old" | tr -d '[0-9a-zA-Z_]')"
+	if [ -n "$n2n_name_old_judge" ];then
+		json_init
+		json_add_string code "7"
+		json_add_string reason "n2n_name_old need use 0-9, a-z, A-Z and _"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ -z "$server_ip" -o -z "$server_port" -o -z "$table" -o -z "$subnet_name" ];then
+		json_init
+		json_add_string code "5"
+		json_add_string reason	"have required var is empty"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	server_port_judge="$(echo "$server_port" | tr -d '[0-9]')"
+	if [ -n "$server_port_judge" ];then
+		json_init
+		json_add_string code "6"
+		json_add_string reason	"server_port set error , should set number"
+		echo -n "$(json_dump)"
+		return
+	else
+		if [ "$server_port" -gt "65535" -o  "$server_port" -lt "0"  ];then
+			json_init
+			json_add_string code "6"
+			json_add_string reason	"server_port set error , out of range ,should set 0-65535"
+			echo -n "$(json_dump)"
+			return
+		fi
+	fi
+
+	if [ -z "$n2n_name" ];then
+		json_init
+		json_add_string code "3"
+		json_add_string reason	"n2n_name is empty"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	if [ -n "$n2n_name_old" ];then
+		n2n_list="$(uci show network | grep "proto='n2n'" | awk -F '.' '{print $2}')"
+		n2n_section_old_judge="$(echo "$n2n_list" | grep -w "$n2n_name_old")"
+		if [ -z "$n2n_section_old_judge" ];then
+			json_init
+			json_add_string code "8"
+			json_add_string reason	"n2n section name change fail,no have $n2n_name_old section"
+			echo -n "$(json_dump)"
+			return
+		fi
+		#判断要修改的 n2n_name 是否与network接口重名
+		network_section_list="$(uci show network | grep "=interface" | awk -F '.' '{print $2}' | awk -F '=' '{print $1}')"
+		network_section_judge="$(echo "$network_section_list" | grep -w "$n2n_name")"
+		if [ -n "$network_section_judge" ];then
+			json_init
+			json_add_string code "9"
+			json_add_string reason	"n2n section name set fail,network have $n2n_name section"
+			echo -n "$(json_dump)"
+			return
+		fi
+		#修改网络接口名和防火墙名称与接口
+		uci rename network.${n2n_name_old}="$n2n_name"
+		uci rename firewall.${n2n_name_old}="$n2n_name"
+		# uci set firewall.${n2n_name}.network="$n2n_name"
+		# uci set firewall.${n2n_name}.name="$n2n_name"
+		zone_rename_section="$(uci show firewall | sed -n 's/firewall.\(@zone\[[0-9]\+\]\).name='\'$n2n_name_old\''/\1/p')"
+		uci set firewall.${zone_rename_section}.network="$n2n_name"
+		uci set firewall.${zone_rename_section}.name="$n2n_name"
+		
+		# uci commit network
+		# uci commit firewall
+	fi
+
+	n2n_section="$n2n_name"
+	# n2n_list="$(cat /etc/config/network | grep "config interface" | sed -n 's/.*n2n\([0-9]\+\).*/\1/p')"
+	n2n_list="$(uci show network | grep "proto='n2n'" | awk -F '.' '{print $2}')"
+	n2n_section_judge="$(echo "$n2n_list" | grep -w "$n2n_name")"
+	if [ "$n2n_delete" == 1 ];then
+		if [ -z "$n2n_section_judge" ];then
+			json_init
+			json_add_string code "2"
+			json_add_string reason	"n2n delete fail,no have $n2n_name section"
+			echo -n "$(json_dump)"
+			return
+		else
+			#删除网络和防火墙接口配置
+			uci delete network.${n2n_section}
+			zone_del_section="$(uci show firewall | sed -n 's/firewall.\(@zone\[[0-9]\+\]\).name='\'$n2n_section\''/\1/p')"
+			uci delete firewall.${zone_del_section}
+		fi
+	else
+		if [ -z "$n2n_section_judge" ];then
+			#n2n 不存在时判断section 是否与network接口重名
+			network_section_list="$(uci show network | grep "=interface" | awk -F '.' '{print $2}' | awk -F '=' '{print $1}')"
+			network_section_judge="$(echo "$network_section_list" | grep -w "$n2n_section")"
+			if [ -n "$network_section_judge" ];then
+				json_init
+				json_add_string code "9"
+				json_add_string reason	"n2n section name set fail,network have $n2n_section section"
+				echo -n "$(json_dump)"
+				return
+			fi
+			#添加网络接口配置
+			uci set network.${n2n_section}=interface
+			uci set network.${n2n_section}.proto=n2n
+			#添加防火墙接口配置
+			zone_section="$(uci add firewall zone)"
+			uci set firewall.${zone_section}.name="$n2n_section"
+			uci set firewall.${zone_section}.input=ACCEPT
+			uci set firewall.${zone_section}.output=ACCEPT
+			uci set firewall.${zone_section}.forward=DROP
+			uci set firewall.${zone_section}.network="$n2n_section"
+		fi
+		#修改网络接口配置
+		uci set network.${n2n_section}.server="$server_ip"
+		uci set network.${n2n_section}.port="$server_port"
+		uci set network.${n2n_section}.table="$table"
+		uci set network.${n2n_section}.natip="$natip"
+		uci set network.${n2n_section}.community="$subnet_name"
+		uci set network.${n2n_section}.key="$key"
+		uci set network.${n2n_section}.mode="$mode"
+		uci set network.${n2n_section}.ipaddr="$ip"
+		uci set network.${n2n_section}.netmask="$subnetmask"
+		uci set network.${n2n_section}.gateway="$gateway"
+		uci set network.${n2n_section}.auto="$auto"
+	fi
+
+	uci commit network
+	uci commit firewall
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"n2n set success"
+	echo -n "$(json_dump)"
+	(sleep 3;/etc/init.d/network restart)&
+}
+
+get_redirect_dnat(){
+	redirect_list="$(uci show firewall | awk -F '.' '/firewall.@redirect\[[0-9]*\].target='\'DNAT\''/{print $2}')"
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"firewall redirect get success"
+	json_add_array 'data'
+	for redirect_tmp in $redirect_list
+	do
+		name="$(my_uci_get firewall.${redirect_tmp}.name)"
+		proto="$(my_uci_get firewall.${redirect_tmp}.proto)"
+		proto="$(echo "$proto" | tr ' ' '+')"
+		src="$(my_uci_get firewall.${redirect_tmp}.src)"
+		src_dport="$(my_uci_get firewall.${redirect_tmp}.src_dport)"
+		dest="$(my_uci_get firewall.${redirect_tmp}.dest)"
+		dest_ip="$(my_uci_get firewall.${redirect_tmp}.dest_ip)"
+		dest_port="$(my_uci_get firewall.${redirect_tmp}.dest_port)"
+		enabled="$(my_uci_get firewall.${redirect_tmp}.enabled)"
+		[ -z "$enabled" ] && enabled=1
+		json_add_object
+		json_add_string name   "$name"
+		json_add_string proto   "$proto"
+		json_add_string src   "$src"
+		json_add_string src_dport   "$src_dport"
+		json_add_string dest   "$dest"
+		json_add_string dest_ip   "$dest_ip"
+		json_add_string dest_port   "$dest_port"
+		json_add_string enabled   "$enabled"
+		json_close_object
+	done
+	json_close_array
+	json_add_array 'zone_list'
+		zone_list="$(uci show firewall | sed -n 's/firewall.@zone\[[0-9]*\].name=\(.*\)/\1/p' | tr -d "[']")"
+		for zone_tmp in $zone_list
+		do
+			json_add_string zone_tmp "$zone_tmp"
+		done
+	json_close_array
+	echo -n "$(json_dump)"
+}
+
+
+set_redirect_dnat(){
+	access_token="$FORM_access_token"
+	check_token "$access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "check access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	json_load "$FORM_body"
+	json_get_var name name
+	json_get_var proto proto
+	json_get_var src src
+	json_get_var src_dport src_dport
+	json_get_var dest dest
+	json_get_var dest_ip dest_ip
+	json_get_var dest_port dest_port
+	json_get_var name_delete name_delete
+	json_get_var name_old name_old
+	json_get_var enabled enabled
+
+	if [ -z "$name" ];then
+		json_init
+		json_add_string code "4"
+		json_add_string reason "redirect name must not be null"
+		echo -n "$(json_dump)"
+		return
+	fi
+	proto="$(echo "$proto" | tr '+' ' ')"
+
+	src_dport_test="$(echo "$src_dport" | tr -d "[0-9]")"
+	if [ "$src_dport_test" = "-" ];then
+		src_dport_start="$(echo "$src_dport" | sed -n 's/\([0-9]\+\)-[0-9]\+/\1/p')"
+		src_dport_stop="$(echo "$src_dport" | sed -n 's/[0-9]\+-\([0-9]\+\)/\1/p')"
+		if [ -z "$src_dport_start" ] || [ -z "$src_dport_stop" ] || \
+		[ "$src_dport_start" -gt 65535 -o "$src_dport_start" -lt 0 ] || \
+		[ "$src_dport_stop" -gt 65535 -o "$src_dport_stop" -lt 0 ] || \
+		[ "$src_dport_start" -gt "$src_dport_stop" ];then
+			src_dport_judge=fail
+		fi
+	elif [ -z "$src_dport_test" ];then
+		if [ -n "$src_dport" ] && [ "$src_dport" -gt 65535 -o "$src_dport" -lt 0 ];then
+			src_dport_judge=fail
+		fi
+	else
+		src_dport_judge=fail
+	fi
+
+	if [ "$src_dport_judge" == "fail" ];then
+		json_init
+		json_add_string code "5"
+		json_add_string reason "src_dport is not right"
+		echo -n "$(json_dump)"
+		return
+	fi
+	
+	dest_port_test="$(echo "$dest_port" | tr -d "[0-9]")"
+	if [ "$dest_port_test" = "-" ];then
+		dest_port_start="$(echo "$dest_port" | sed -n 's/\([0-9]\+\)-[0-9]\+/\1/p')"
+		dest_port_stop="$(echo "$dest_port" | sed -n 's/[0-9]\+-\([0-9]\+\)/\1/p')"
+		if [ -z "$dest_port_start" ] || [ -z "$dest_port_stop" ] || \
+		[ "$dest_port_start" -gt 65535 -o "$dest_port_start" -lt 0 ] || \
+		[ "$dest_port_stop" -gt 65535 -o "$dest_port_stop" -lt 0 ] || \
+		[ "$dest_port_start" -gt "$dest_port_stop" ];then
+			dest_port_judge=fail
+		fi
+	elif [ -z "$dest_port_test" ];then
+		if [ -n "$dest_port" ] && [ "$dest_port" -gt 65535 -o "$dest_port" -lt 0 ];then
+			dest_port_judge=fail
+		fi
+	else
+		dest_port_judge=fail
+	fi
+
+	if [ "$dest_port_judge" == "fail" ];then
+		json_init
+		json_add_string code "6"
+		json_add_string reason "dest_port is not right"
+		echo -n "$(json_dump)"
+		return
+	fi
+	
+	if [ "$name_delete" == 1 ];then
+		#删除redirect
+		# redirect_list="$(uci show firewall | grep "=redirect" | awk -F '.' '{print $2}' | awk -F '=' '{print $1}')"
+		redirect_name_judge="$(uci show firewall | sed -n 's/firewall.\(@redirect\[[0-9]\+\]\).name='\'$name\''/\1/p')"
+		if [ -z "$redirect_name_judge" ];then
+			json_init
+			json_add_string code "2"
+			json_add_string reason	"redirect name delete fail,no have $name redirect"
+			echo -n "$(json_dump)"
+			return
+		else
+			#删除防火墙转发规则
+			uci delete firewall.${redirect_name_judge}
+			uci commit firewall
+			json_init
+			json_add_string code "1"
+			json_add_string reason	"set redirect set success"
+			echo -n "$(json_dump)"
+			(/etc/init.d/firewall restart)&
+			return
+		fi
+	fi
+
+	if [ -n "$name_old" ];then
+	#name_old存在 修改redirect
+		redirect_old_name_judge="$(uci show firewall | sed -n 's/firewall.\(@redirect\[[0-9]\+\]\).name='\'$name_old\''/\1/p')"
+		if [ -z "$redirect_old_name_judge" ];then
+			json_init
+			json_add_string code "8"
+			json_add_string reason	"firewall redirect name change fail,no have $name_old redirect"
+			echo -n "$(json_dump)"
+			return
+		fi
+		#判断要修改的 name 是否与旧的redirect重名
+		if [ "$name_old" != "$name" ];then
+			redirect_name_judge="$(uci show firewall | sed -n 's/firewall.\(@redirect\[[0-9]\+\]\).name='\'$name\''/\1/p')"
+			if [ -n "$redirect_name_judge" ];then
+				json_init
+				json_add_string code "9"
+				json_add_string reason	"redirect name set fail,network have $name redirect"
+				echo -n "$(json_dump)"
+				return
+			fi
+		fi
+		#修改防火墙
+		uci set firewall.${redirect_old_name_judge}.name="$name"
+		uci set firewall.${redirect_old_name_judge}.proto="$proto"
+		uci set firewall.${redirect_old_name_judge}.src="$src"
+		uci set firewall.${redirect_old_name_judge}.src_dport="$src_dport"
+		uci set firewall.${redirect_old_name_judge}.dest="$dest"
+		uci set firewall.${redirect_old_name_judge}.dest_ip="$dest_ip"
+		uci set firewall.${redirect_old_name_judge}.dest_port="$dest_port"
+		uci set firewall.${redirect_old_name_judge}.enabled="$enabled"
+	else
+	#name_old不存在 添加redirect 判断要添加的 name 是否与旧的redirect重名
+		redirect_name_judge="$(uci show firewall | sed -n 's/firewall.\(@redirect\[[0-9]\+\]\).name='\'$name\''/\1/p')"
+		if [ -n "$redirect_name_judge" ];then
+				json_init
+				json_add_string code "9"
+				json_add_string reason	"redirect name set fail,network have $name redirect"
+				echo -n "$(json_dump)"
+				return
+		fi
+		redirect_name_judge="$(uci add firewall redirect)"
+		uci set firewall.${redirect_name_judge}.target="DNAT"
+		uci set firewall.${redirect_name_judge}.name="$name"
+		uci set firewall.${redirect_name_judge}.proto="$proto"
+		uci set firewall.${redirect_name_judge}.src="$src"
+		uci set firewall.${redirect_name_judge}.src_dport="$src_dport"
+		uci set firewall.${redirect_name_judge}.dest="$dest"
+		uci set firewall.${redirect_name_judge}.dest_ip="$dest_ip"
+		uci set firewall.${redirect_name_judge}.dest_port="$dest_port"
+		uci set firewall.${redirect_name_judge}.enabled="$enabled"
+	fi
+
+	uci commit firewall
+	json_init
+	json_add_string code "1"
+	json_add_string reason	"set redirect set success"
+	echo -n "$(json_dump)"
+	(/etc/init.d/firewall restart)&
+}
+
+get_shadowsock_info()
+{
+	serverip="$(my_uci_get shadowsocks-libev.sss0.server)"
+	serverport="$(my_uci_get shadowsocks-libev.sss0.server_port)"
+	enc="$(my_uci_get shadowsocks-libev.sss0.method)"
+	key="$(my_uci_get shadowsocks-libev.sss0.key)"
+
+	listen_port="$(my_uci_get shadowsocks-libev.hi.local_port)"
+	mode="$(my_uci_get shadowsocks-libev.hi.mode)"
+	enable_mptcp="$(my_uci_get shadowsocks-libev.hi.mptcp)"
+	enable="$(my_uci_get shadowsocks-libev.sss0.disabled)"
+	if [ "$enable_mptcp" == "0" -o "$enable" == "1" ];then
+		enable_mptcp=0
+	fi
+
+	json_init
+	json_add_string enable_mptcp "$enable_mptcp"
+	json_add_string serverip "$serverip"
+	json_add_string serverport "$serverport"
+	json_add_string enc "$enc"
+	json_add_string key "$key"
+	json_add_string listen_port "$listen_port"
+	json_add_string mode "$mode"
+
+	echo $(json_dump)
+}
+get_ss_dns(){
+
+	enable_mptcp="$(my_uci_get shadowsocks-libev.dns.disabled)"
+	if [ "$enable_mptcp" == "1" ];then
+		enable_mptcp=0
+	else
+		enable_mptcp=1
+	fi
+	tunnel_peer_ip="$(my_uci_get shadowsocks-libev.dns.tunnel_address)"
+	mode="$(my_uci_get shadowsocks-libev.dns.mode)"
+	listen_port="$(my_uci_get shadowsocks-libev.dns.local_port)"
+	serverip="$(my_uci_get shadowsocks-libev.dns.server)"
+
+	json_init
+	json_add_string enable_mptcp "$enable_mptcp"
+	json_add_string tunnel_peer_ip "$tunnel_peer_ip"
+	json_add_string listen_port "$listen_port"
+	json_add_string serverip "$serverip"
+	json_add_string mode "$mode"
+
+	echo "$(json_dump)"
+}
+
+get_mptcp_info(){
+	global_mp="$(my_uci_get network.globals.multipat)"
+	if [ "$global_mp" == "disable" ];then
+		globle_mptcp_enable=0
+	else
+		globle_mptcp_enable=1
+	fi
+
+	lan_mp="$(my_uci_get network.lan.multipath)"
+	if [ "$lan_mp" == "off" ];then
+		lan=0
+	else
+		lan=1
+	fi
+
+	wan_mp="$(my_uci_get network.wan.multipath)"
+	if [ "$wan_mp" == "off" ];then
+		wan=0
+	else
+		wan=1
+	fi
+
+	json_init
+	json_add_string globle_mptcp_enable $globle_mptcp_enable
+	json_add_string wan $wan
+	json_add_string lan $lan
+	json_add_string code 1
+
+	wan4g_num="$(uci show network | grep "4gwan" | wc -l)"
+	if [ "$wan4g_num" == "0" ];then
+		echo -n "$(json_dump)"
+		return
+	elif [ "$wan4g_num" == "1" ];then
+		enable="$(my_uci_get network.4gwan.multipath)"
+		json_add_string 4gwan $4gwan
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	cnt=$wan4g_num
+	while [ $cnt -gt 0 ]
+	do
+		enable="$(my_uci_get network.4gwan${cnt}.multipath)"
+		if [ "$enable" == "off" ];then
+			enable=0
+		else
+			enable=1
+		fi
+		json_add_string 4gwan${num} $enable
+
+		cnt=$((cnt - 1))
+	done
+
+	echo -n "$(json_dump)"
+}
+
+app_home(){
+	[ ! -d /tmp/anyos ] && mkdir /tmp/anyos
+	wan_ifname="$(my_uci_get network.wan.ifname)"
+	net_status="none"
+	[ -f "/tmp/netstat.txt" ] && net_status="$(cat /tmp/netstat.txt)"
+	if [ "$net_status" == "none" ];then
+		internet_interface=none
+	elif [ "$net_status" == "$wan_ifname" -o "$net_status" == "pppoe-wan" -o "$net_status" == "pptp-pptp" -o "$net_status" == "l2tp-l2tp" ];then
+		internet_interface=ether
+	elif [ "$net_status" == "wlan2" ];then
+		internet_interface=wifi
+	else
+		internet_interface=4g
+	fi
+	debug_echo "internet_interface $internet_interface"
+
+	timestamp_current="$(date +%s)"
+	while [ ! -f /tmp/module_ifname ]
+	do
+		/usr/sbin/anywifi/rclocal.d/S99_module_ifname &
+		sleep 2
+	done
+	module_ifname="$(cat /tmp/module_ifname)"
+	module_proto="$(my_uci_get network.4gwan.proto)"
+	[ "$module_proto" == "3g" ] && module_ifname="3g-4gwan"
+	[ -z "$module_ifname" ] && module_ifname=NO_IFNAME
+
+	traffic_now="$(cat /proc/net/dev)"
+	wan_rx_current="$(echo "$traffic_now"| grep -w "$wan_ifname" | awk '{print $2}')"
+	wan_tx_current="$(echo "$traffic_now"| grep -w "$wan_ifname" | awk '{print $10}')"
+
+	module_rx_current="$(echo "$traffic_now"| grep -w "$module_ifname" | awk '{print $2}')"
+	module_tx_current="$(echo "$traffic_now"| grep -w "$module_ifname" | awk '{print $10}')"
+
+	wifi_rx_current="$(echo "$traffic_now"| grep -w "wlan2" | awk '{print $2}')"
+	wifi_tx_current="$(echo "$traffic_now"| grep -w "wlan2" | awk '{print $10}')"
+
+	#Content in file
+	if [ ! -f /tmp/anyos/app_traffic ];then
+		wan_rx_speed=0
+		wan_tx_speed=0
+		module_rx_speed=0
+		module_tx_speed=0
+		wifi_rx_speed=0
+		wifi_tx_speed=0
+	else
+		#获取过去流量信息
+		. /tmp/anyos/app_traffic
+		timestamp_diff="$((timestamp_current-timestamp_old))"
+		[ "$timestamp_diff" == "0" ] && timestamp_diff=1
+		#计算间隔时间
+		wan_rx_diff="$((wan_rx_current-wan_rx_old))"
+		wan_tx_diff="$((wan_tx_current-wan_tx_old))"
+
+		module_rx_diff="$((module_rx_current-module_rx_old))"
+		module_tx_diff="$((module_tx_current-module_tx_old))"
+
+		wifi_rx_diff="$((wifi_rx_current-wifi_rx_old))"
+		wifi_tx_diff="$((wifi_tx_current-wifi_tx_old))"
+		#计算速度
+		wan_rx_speed=$((wan_rx_diff/timestamp_diff))
+		wan_tx_speed=$((wan_tx_diff/timestamp_diff))
+
+		module_rx_speed=$((module_rx_diff/timestamp_diff))
+		module_tx_speed=$((module_tx_diff/timestamp_diff))
+
+		wifi_rx_speed=$((wifi_rx_diff/timestamp_diff))
+		wifi_tx_speed=$((wifi_tx_diff/timestamp_diff))
+
+		#过滤错误数值
+		if [ -z "$wan_rx_speed" ] || [ "$wan_rx_speed" -lt "0" ] || [ -z "$wan_tx_speed" ] || [ "$wan_tx_speed" -lt "0" ];then
+			wan_tx_speed="0"
+			wan_rx_speed="0"
+		fi
+
+		if [ -z "$module_rx_speed" ] || [ "$module_rx_speed" -lt "0" ] || [ -z "$module_tx_speed" ] || [ "$module_tx_speed" -lt "0" ];then
+			module_rx_speed="0"
+			module_tx_speed="0"
+		fi
+
+		if [ -z "$wifi_rx_speed" ] || [ "$wifi_rx_speed" -lt "0" ] || [ -z "$wifi_tx_speed" ] || [ "$wifi_tx_speed" -lt "0" ];then
+			wifi_rx_speed="0"
+			wifi_tx_speed="0"
+		fi
+	fi
+
+	# 接口实际显示当前默认网口流速
+	if [ "$internet_interface" == "ether" ];then
+		interface_rx_speed="$wan_rx_speed"
+		interface_tx_speed="$wan_tx_speed"
+	elif [ "$internet_interface" == "4g" ];then
+		interface_rx_speed="$module_rx_speed"
+		interface_tx_speed="$module_tx_speed"
+	elif [ "$internet_interface" == "wifi" ];then
+		interface_rx_speed="$wifi_rx_speed"
+		interface_tx_speed="$wifi_tx_speed"
+	else
+		internet_interface="none"
+		interface_rx_speed=0
+		interface_tx_speed=0
+	fi
+
+	if [ "$internet_interface" != none ];then
+		internet_status=1
+	else
+		internet_status=0
+	fi
+#按格式打印时间戳和各个接口流量信息
+echo -e "\
+timestamp_old=${timestamp_current}\n\
+wan_rx_old=${wan_rx_current}\n\
+wan_tx_old=${wan_tx_current}\n\
+
+module_rx_old=${module_rx_current}\n\
+module_tx_old=${module_tx_current}\n\
+
+wifi_rx_old=${wifi_rx_current}\n\
+wifi_tx_old=${wifi_tx_current}\n\
+" \
+> /tmp/anyos/app_traffic
+
+
+	json_init
+	json_add_string internet_status "$internet_status"
+	json_add_string rx "$interface_rx_speed"
+	json_add_string tx "$interface_tx_speed"
+	echo -n "$(json_dump)"
+}
+
+get_log_list(){
+	[ -e /www/log_list ] && log_data="$(cat /www/log_list)"
+
+	json_init
+	json_add_string code "1"
+	json_add_string data "$log_data"
+	echo -n "$(json_dump)"
+}
+
+get_samba_info(){
+	smb_addr="$(my_uci_get network.lan.ipaddr)"
+	smb_share_name="$(my_uci_get samba.@sambashare[0].name)"
+	any_samba_disabled="$(uci -q get anyos.samba.any_samba_disabled)"
+	any_samba_disabled="$((any_samba_disabled ^ 0))"
+	smb_username="$(my_uci_get any_samba.base.smb_username)"
+	smb_passwd="$(my_uci_get any_samba.base.smb_passwd)"
+
+	echo -n "{\"code\":\"1\",\"smb_username\":\"$smb_username\",\"smb_passwd\":\"$smb_passwd\",\"smb_addr\":\"\\\\\\\\${smb_addr}\\\\${smb_share_name}\",\"any_samba_disabled\":\"${any_samba_disabled}\"}"
+}
+
+set_samba_info(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	json_load   "$FORM_body"
+	json_get_var smb_username smb_username
+	json_get_var smb_passwd smb_passwd
+	json_get_var smb_share_name smb_share_name
+	uci set any_samba.base.smb_username="$smb_username"
+	uci set any_samba.base.smb_passwd="$smb_passwd"
+	uci set samba.@sambashare[0].name="$smb_share_name"
+	uci commit any_samba
+	uci commit samba
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set_samba_info success"
+	echo -n "$(json_dump)"
+	(/etc/init.d/any_samba restart) &
+}
+
+set_samba_status(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+	json_load   "$FORM_body"
+	json_get_var any_samba_disabled any_samba_disabled
+	any_samba_disabled="$((any_samba_disabled ^ 0))"
+	section="$(my_uci_get anyos.samba)"
+	[ -n "$section" ] || uci set anyos.samba="info"
+	uci set anyos.samba.any_samba_disabled="$any_samba_disabled"
+	uci commit anyos
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set_samba_status success"
+	echo -n "$(json_dump)"
+	(/etc/init.d/any_samba restart) &
+}
+
+get_imei(){
+	imei=$(cat /tmp/4ginfo | grep "imei" | awk -F '"' '{print $4}')
+	set_imei="$(my_uci_get network.4gwan.imei)"
+	[ -n $imei ] || imei="NOT GET"
+	[ -n $set_imei ] || set_imei="NOT SET"
+	json_init
+	json_add_string code "1"
+	json_add_string imei "$imei"
+	json_add_string set_imei "$set_imei"
+	json_add_string reason "get imei ok"
+	echo -n "$(json_dump)"
+}
+
+set_imei(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	new_imei=$FORM_imei
+	new_imei_len=$(echo "$new_imei" | wc -L)
+	if [ -n "$new_imei" -a "$new_imei_len" == "15" ];then
+		uci set network.4gwan.imei="$new_imei"
+		uci commit network
+		code="1"
+		reason="set new imei ok"
+	else
+		code="2"
+		reason="not set imei"
+	fi
+
+	json_init
+	json_add_string code "$code"
+	json_add_string reason "$reason"
+	echo -n "$(json_dump)"
+}
+
+get_ttl(){
+	section="$(uci show firewall | awk -F '.' '/firewall.set_ttl/ {print $2}')"
+	ttl_enabled="$(my_uci_get firewall.${section}.enabled)"
+	ttl_cnt="$(my_uci_get firewall.${section}.ttl_cnt)"
+
+	json_init
+	json_add_string code "1"
+	json_add_string reason "get ttl ok"
+	json_add_string ttl_enabled "${ttl_enabled:-1}"
+	json_add_string ttl_cnt "${ttl_cnt:-64}"
+
+	echo -n "$(json_dump)"
+}
+
+set_ttl(){
+	check_token "$FORM_access_token"
+	if [ "$?" != "0" ]; then
+		json_init
+		json_add_string code "-1"
+		json_add_string reason "access_token err"
+		echo -n "$(json_dump)"
+		return
+	fi
+
+	json_load   "$FORM_body"
+	json_get_var ttl_enabled ttl_enabled
+	ttl_enabled="$((ttl_enabled ^ 0))"
+	json_get_var ttl_cnt ttl_cnt
+
+	section="$(uci show firewall | awk -F '.' '/firewall.set_ttl/ {print $2}')"
+	if [ -z "$section" ];then
+		section="$(uci add firewall include)"
+		uci set firewall.${section}.path="/usr/sbin/anywifi/firewall.set_ttl"
+		uci set firewall.${section}.reload=1
+	fi
+	uci set firewall.${section}.enabled="$ttl_enabled"
+	uci set firewall.${section}.ttl_cnt="${ttl_cnt:-64}"
+	uci commit firewall
+	json_init
+	json_add_string code "1"
+	json_add_string reason "set ttl success"
+	echo -n "$(json_dump)"
+	sleep 1
+	/etc/init.d/firewall restart >/dev/null 2>&1 &
+}

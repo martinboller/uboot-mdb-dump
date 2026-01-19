@@ -1,0 +1,12 @@
+
+config server
+	option server 'ngrok.online-string.com'
+	option port '5556'
+
+config connection
+	option lan 'eth0'
+	option domain 'devmac'
+	option protocol 'http'
+	option rport '0'
+	option lhost '127.0.0.1'
+	option lport '8080'

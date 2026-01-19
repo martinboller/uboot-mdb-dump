@@ -1,0 +1,112 @@
+#!/bin/sh
+
+###
+### 所有产品统一的老化脚本
+### 输入看门狗标识决定是否喂狗，并且决定看门狗的引脚
+### 输入看门狗标识决定是否喂狗，并且决定看门狗的引脚
+### 流程：配置看门狗 ——> 运行看门狗喂狗 ——> 更新老化时间
+###
+### 参数说明 :
+### 参数1：输入"1"和"2"都可以视为有看门狗，
+###	   "1"是使用mtk的gpio命令写寄存器方式改变电平喂狗
+###	   "2"是使用cat给文件写电平的方式喂狗，
+### 参数2：看门狗引脚
+###
+
+wdFlag="$1"
+wdGpio="$2"
+
+###配置系统看门狗
+if [ "$wdFlag" = "1" ];then
+
+cat > /tmp/feed_dog.sh <<EOF
+#!/bin/sh
+
+while true
+do
+    gpio l $wdGpio 4000 0 1 0 4000 >/dev/null	
+    sleep 1
+    gpio l $wdGpio 0 4000 1 0 0 >/dev/null
+    sleep 1
+    gpio l $wdGpio 4000 0 1 0 4000 >/dev/null	
+    sleep 1
+    gpio l $wdGpio 0 4000 1 0 0 >/dev/null
+    sleep 1
+    gpio l $wdGpio 4000 0 1 0 4000 >/dev/null	
+    sleep 1
+    gpio l $wdGpio 0 4000 1 0 0 >/dev/null
+    sleep 1
+    echo "feed_dog.sh:-------------Feed" >>/tmp/watchdog.log 
+done
+
+EOF
+
+chmod 777 /tmp/feed_dog.sh
+
+elif [ "$wdFlag" = "2" ];then
+
+    if [ ! -e "/sys/class/gpio/gpio$wdGpio" ];then
+
+	echo "$wdGpio" > /sys/class/gpio/export
+    fi
+    echo "out" > /sys/class/gpio/gpio$wdGpio/direction 
+
+cat > /tmp/feed_dog_2.sh <<EOF
+#!/bin/sh
+
+while true
+do
+    echo "1" > /sys/class/gpio/gpio$wdGpio/value
+    sleep 1
+    echo "0" > /sys/class/gpio/gpio$wdGpio/value
+    sleep 1
+done
+
+EOF
+
+chmod 777 /tmp/feed_dog_2.sh
+
+fi
+
+###运行系统看门狗
+if [ "$wdFlag" = "1" ];then
+
+    chmod 777 /tmp/feed_dog.sh
+    /tmp/feed_dog.sh &
+fi
+if [ "$wdFlag" = "2" ];then
+
+    chmod 777 /tmp/feed_dog_2.sh
+    /tmp/feed_dog_2.sh &
+fi
+
+if [ ! -f "/etc/douptime.log" ] ;then
+    echo "0" > /etc/douptime.log
+fi
+
+###运行写入现在的时间和系统运行时间，就可以大概知道启动了几次
+runtime=`awk '{print $1}' /proc/uptime |sed 's/\..*$//'`
+nowdate=`date`
+echo "系统运行时间：$runtime" >> /etc/run_douptime.log
+echo "当前时间：$nowdate" >> /etc/run_douptime.log
+
+echo "-----------------------------华丽分割线--------------------------------" >> /etc/run_douptime.log
+echo ""
+
+###随时更新老化数据
+while true
+do
+    sys_runtime=`awk '{print $1}' /proc/uptime |sed 's/\..*$//'`
+    douptime_time=`cat /etc/douptime.log 2>/dev/null`
+
+    if [ "$sys_runtime" -gt "$douptime_time" ];then
+	echo "$sys_runtime" > /etc/douptime.log	
+    elif [ "$sys_runtime" -le "$douptime_time" ];then
+	echo " " > /dev/null
+    else 
+	echo "0" > /etc/douptime.log 
+    fi
+    sleep 10
+done
+
+

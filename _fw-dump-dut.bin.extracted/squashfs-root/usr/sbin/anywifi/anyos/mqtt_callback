@@ -1,0 +1,216 @@
+#!/bin/sh
+
+[[ "$(pidof ${0##*/} | wc -w)" -gt "2" ]] && echo "$0 Already running ..." && return 2
+
+debug=$(echo $@ | grep "\-\-debug" | wc -l)
+debug_echo(){ if [[ "$debug" == "1" ]];then message="$(date +%s) $1"; echo "$message" 1>&2; logger "$message" >/dev/null 2>&1;fi }
+
+LOG_PATH=/www/log_list
+
+log_write(){
+	log_date="$(date "+%Y-%m-%d %H:%M:%S")"
+	log_content="$1"
+	log_line="$log_date $log_content"
+	log_num="$(wc -l "$LOG_PATH" | awk '{print $1}')"
+	[ -e "$LOG_PATH" ] || echo "$log_date sys:\"Start logging\"" > "$LOG_PATH"
+	if [ "$log_num" -gt 100 ];then
+		debug_echo "$LOG_PATH is too big  = $log_num"
+		sed -i "1i $log_line" "$LOG_PATH"
+		sed -i '101,$d' "$LOG_PATH"
+	else
+		debug_echo "$LOG_PATH is righet = $log_num"
+		sed -i "1i $log_line" "$LOG_PATH"
+	fi
+	debug_echo "$log_line"
+	return 0
+}
+
+my_uci_get(){
+        if [ "$(uci get "$1" 2>&1 | grep "Entry not found" | wc -l)" == "1" ];then
+                debug_echo "$1 not found"  1>&2
+        else
+                echo -n "$(uci get "$1")"
+        fi
+}
+
+. /usr/share/libubox/jshn.sh
+body="$1"
+if [ -z "$body" ];then
+	debug_echo "json data is empty, quit"
+	exit
+fi
+
+device_id="$(cat /proc/flashid)"
+# not have flashid
+if [ -z "$flashid" ];then
+	debug_echo "Flashid is empty, fatal error, quit"
+	device_id="$(ifconfig br-lan | awk '/HWaddr/{print $5}' | tr -d ':')"
+	#exit
+fi
+#fisrt response cmd_id
+json_load    "$body"
+json_get_var cmd_id cmd_id
+[ -n "$cmd_id" ] || cmd_id="1234"
+. /usr/sbin/anywifi/anyos/uplink_interface "$cmd_id"
+response
+
+#begin analysis op
+json_load    "$body"
+json_get_var op op
+
+if [ "$op" = "refresh" ];then
+	status
+	log
+fi
+
+if [ "$op" = "reset_accept" ];then
+	[ -n "$(uci -q get anyos.rest_accept)" ] || uci set anyos.rest_accept=info
+	uci commit anyos
+fi
+
+if [ "$op" = "changeWireless2" ];then
+
+	json_get_var device_id device_id
+	json_get_var ssid ssid
+	json_get_var ssid_hide ssid_hide
+	json_get_var channel channel
+	json_get_var htmode htmode
+	json_get_var encryption encryption
+	json_get_var key key
+	
+	if [ -z "$ssid" ];then
+		ssid="default_radio0"
+	fi
+
+	if [ "$channel" -ge 1 ] && [ "$channel" -le 13 ];then
+		channel="$channel"
+	else
+		channel="0"
+	fi
+	
+	if [ "$htmode" == "HT40" ];then
+		bw=1
+	else
+		bw=0
+	fi
+
+	if [ -z "$encryption" ];then
+		encryption="none"
+	fi
+
+	#if not have key,set default key=12345678
+	key_num="$(echo "$key" | wc -c)"
+	if [[ "$encryption" != "none" ]] && [ "$key_num" -lt "9" ];then
+		key="12345678"
+	fi
+	if [[ "$encryption" != "none" ]] && [[ -z "$key" ]];then
+		key="12345678"
+	fi
+	
+	wifi2_device="$(my_uci_get anyos.wifi.wifi2_device)"
+	uci set wireless.default_radio0.ssid="$ssid"
+	uci set wireless.default_radio0.hidden="$ssid_hide"
+	uci set wireless.${wifi2_device}.channel="$channel"
+	uci set wireless.${wifi2_device}.bw="$bw"
+	uci set wireless.default_radio0.encryption="$encryption"
+	uci set wireless.default_radio0.key="$key"
+	
+	uci commit wireless
+	status
+	wifi &
+fi
+
+if [ "$op" = "changeWireless5" ];then
+	wifi5="$(my_uci_get anyos.wifi.wifi5_device)"
+	if [ -z $wifi5 ];then
+		debug_echo "Not have wifi5, quit"
+		exit
+	fi
+	
+	json_get_var device_id device_id
+	json_get_var ssid ssid
+	json_get_var ssid_hide ssid_hide
+	json_get_var channel channel
+	json_get_var htmode htmode
+	json_get_var encryption encryption
+	json_get_var key key
+	
+	if [ -z "$ssid" ];then
+		ssid="wifi-5.8g"
+	fi
+
+	if [ -z "$channel" ] || [ -n "$(echo "$channel" | tr -d [0-9])" ] ;then
+		channel="0"
+	fi
+
+	if [ "$htmode" == "HT20" -o "$htmode" == "" ];then
+		bw=0
+	elif [ "$htmode" == "HT40" ];then
+		bw=1
+	elif [ "$htmode" == "HT80" ];then
+		bw=2
+	fi
+	
+	if [ -z "$encryption" ];then
+		encryption="none"
+	fi
+
+	#if not have key,set default key=12345678
+	key_num="$(echo "$key" | wc -c)"
+	if [[ "$encryption" != "none" ]] && [ "$key_num" -lt "9" ];then
+		key="12345678"
+	fi
+	if [[ "$encryption" != "none" ]] && [[ -z "$key" ]];then
+		key="12345678"
+	fi
+
+	wifi5_device="$(my_uci_get anyos.wifi.wifi5_device)"
+	uci set wireless.default_radio1.ssid="$ssid"
+	uci set wireless.default_radio1.hidden="$ssid_hide"
+	uci set wireless.${wifi5_device}.channel="$channel"
+	uci set wireless.${wifi5_device}.bw="$bw"
+	uci set wireless.default_radio1.encryption="$encryption"
+	uci set wireless.default_radio1.key="$key"
+
+	uci commit wireless
+	status
+	wifi &
+fi
+
+if [ "$op" = "changePassword" ];then
+	json_get_var password password
+	#if not have password,set default password=admin
+	if [ -z "$password" ];then
+		password="admin"
+	fi
+	
+	(echo "$password";sleep 1;echo "$password") | passwd > /dev/null
+	(passchk "root" "$password")
+	if [ "$?" != "0" ]; then
+		return
+	fi
+fi
+
+if [ "$op" = "reboot" ];then
+	log_content="sys:\"reboot system\""
+	log_write "$log_content"
+	reboot
+fi
+
+if [ "$op" = "activate_ngrokc" ];then
+	killall ngrokc
+	uci commit anyos
+	/usr/sbin/anywifi/crond.d/S99_check_ngrokc &
+fi
+
+if [ "$op" = "switch_ngrok" ];then
+	json_get_var enable enable
+	uci set anyos.cloud_weblogin.switch="$enable"
+	uci commit anyos
+	/usr/sbin/anywifi/crond.d/S99_check_ngrokc &
+	reportNgrokId
+fi
+
+if [ "$op" = "reportGps" ];then
+	reportGps
+fi

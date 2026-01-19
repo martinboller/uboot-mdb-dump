@@ -1,0 +1,166 @@
+#!/usr/bin/perl
+
+require "/lib/core.cgi";
+
+my $logfile = '/tmp/ngrokc.log';
+
+## begin of yunlogin watch
+if ($ARGV[0] eq 'watch') {
+
+	my $cmd = &read1line('/tmp/ngrokc.cmd');
+	die "ERR: no cmd\n" if (! $cmd);
+	&run_as_daemon($cmd,$logfile);
+	sleep 2;
+
+    my $yun_login_url = '';
+    while (1) {
+        if (-s $logfile > 512*1024) {
+            open CL,'>',$logfile and close CL;
+        }
+
+        my @rpid = &checkRunning('/ngrokc',$$);
+		#&_log("ngrokc status: " . join(',',@rpid) . "\n");
+        if (! scalar @rpid) {
+            my $error = &geterror($logfile);
+            &_log("ERR: $error\n") if ($error);
+			if ($error and &read1line('/tmp/yunlogin.err') ne $error) {
+				open WT,'>','/tmp/yunlogin.err' and print WT $error,"\n" and close WT;
+				system ("uci set my.main.yunlogin_status=0");
+				system ("uci delete my.main.yunlogin_url");
+				system ("uci set my.main.yunlogin_error=$error");
+				system ("uci commit");
+			}
+
+            unlink $logfile;
+            unlink '/tmp/yunlogin.url';
+            &_log(&_now() . " yunlogin process is stopped, now restart it\n");
+            $yun_login_url = '';
+			&run_as_daemon($cmd,$logfile);
+            sleep 5; next;
+        }
+
+        if ($yun_login_url) {
+
+            ### yunlogin url cannot access, reconnect
+            if (time - (stat('/tmp/yunlogin.test'))[9] > 60) {
+                open CL,'>','/tmp/yunlogin.test' and close CL;
+                if (! &test_yunlogin($yun_login_url)) {
+                    &_log(&_now() . " $yun_login_url test failed, now reconnect ...\n");
+        			my @rpid = &checkRunning('/ngrokc',$$);
+					my $pids = join(' ',@rpid);
+                    &_log(&_now() . " kill pid $pids\n");
+					system ("kill $pids");
+					sleep 1;
+					system ("kill -9 $pids");
+                    #system ('killall ngrokc');
+                    next;
+                }
+            }
+            sleep 15;
+            next;
+        }
+
+        open RD,'<',$logfile;
+        while (<RD>) {
+            $yun_login_url = $1 if (/Tunnel established at (\S+)/);
+            $yun_login_url = $1 if (/Add tunnel ok,type:\w+ url:(\S+)/);
+        }
+        close RD;
+		if ($yun_login_url) {
+			unlink '/tmp/yunlogin.err';
+			if (&read1line('/tmp/yunlogin.url') ne $yun_login_url) {
+				open WT,'>','/tmp/yunlogin.url' and print WT $yun_login_url,"\n" and close WT;
+				system ("uci set my.main.yunlogin_url=$yun_login_url");
+				system ("uci delete my.main.yunlogin_error");
+				system ("uci set my.main.yunlogin_status=1");
+				system ("uci commit");
+			}
+		}
+        else {
+            my $error = &geterror($logfile);
+            &_log("ERR: $error\n") if ($error);
+
+			if ($error and &read1line('/tmp/yunlogin.err') ne $error) {
+				open WT,'>','/tmp/yunlogin.err' and print WT $error,"\n" and close WT;
+				system ("uci set my.main.yunlogin_status=0");
+				system ("uci delete my.main.yunlogin_url");
+				system ("uci set my.main.yunlogin_error=$error");
+				system ("uci commit");
+			}
+        }
+        sleep 5;
+    }
+	exit;
+}
+## end of yunlogin watch
+
+chomp (my $enable = `uci get my.main.enable_yunlogin`);
+
+my @watch_rpid = &checkRunning('yunlogin watch',$$);
+system ("kill $watch_rpid[0]") if (scalar @watch_rpid);
+
+my @rpid = &checkRunning('ngrokc',$$);
+
+if (scalar @rpid) {
+	&_log("killing running process\n");
+	system ('killall ngrokc'); 
+	&msleep(500);
+}
+
+if ($enable ne '1') {
+	&_log("yunlogin not enabled\n");
+	unlink ('/tmp/yunlogin.url');
+	exit 0;
+}
+
+chomp (my $name = `uci get my.main.yunlogin_name`);
+if ($name !~ /^[a-z0-9\-]+$/) {
+	$name = lc(&read1line('/sys/class/net/br-lan/address'));
+	$name =~ s/://g;
+	$name = &randstr(8) if (! $name); 
+}
+
+my $sn = &read1line('/tmp/sn');
+my $flashid = &read1line('/proc/flashid');
+my $cmd = "/usr/bin/ngrokc -SER[Shost:ac-link.com,Sport:4443,Atoken:$sn:$flashid] -AddTun[Type:https,Lhost:127.0.0.1,Lport:80,Sdname:$name]";
+open WT,'>','/tmp/ngrokc.cmd' and print WT $cmd,"\n" and close WT;
+&run_as_daemon ("$0 watch");
+&_log("yunlogin script fin\n");
+exit;
+
+sub test_yunlogin {
+    my $url = shift();
+	my $curlog = "/tmp/curltest.log.$$";
+	unlink $curlog if (-e $curlog);
+    system ("curl -k --connect-timeout 15 \"$url\" -i -q -o $curlog");
+	my $ret = &read1line($curlog);
+	if (! $ret) {
+		sleep 5;
+		system ("curl -k --connect-timeout 15 \"$url\" -i -q -o $curlog");
+		$ret = &read1line($curlog);
+	}
+
+	if (! $ret) {
+    	&_log("Yunlogin tunnel test failed: network error\n");
+		return ;
+	}
+	
+	return 1 if ($ret =~ /HTTP.\d.\d (\d+ \w+)/ and $1 eq '200 OK');
+    &_log("Yunlogin tunnel test failed: $ret\n");
+    return;
+}
+
+sub geterror {
+
+    my $logfile = shift();
+    my $error = '';
+    open RD,'<',$logfile;
+    while (<RD>) {
+        $error = "NET_CONN_ERR" if (/connect failed/);
+        $error = "SAME_ID_USED" if (/Server failed to allocate tunnel:.*is already registered/);
+        $error = $1 if (/"Error":"([^"]+)"/);
+    }
+    close RD;
+    return $error;
+}
+

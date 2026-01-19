@@ -1,0 +1,40 @@
+#type PID:VID   data     at           driver
+ec20 2c7c:0125 ttyUSB2 ttyUSB3
+ec20 2c7c:0306 ttyUSB2 ttyUSB3                    coexistence with EP06-E
+ec20 2c7c:0620 ttyUSB2 ttyUSB3                    coexistence with EM160R
+ec200t 2c7c:6026 ttyUSB1 ttyUSB2 
+ec200u 2c7c:6002 ttyUSB1 ttyUSB1
+ec200a 2c7c:6005 ttyUSB1 ttyUSB1
+mc2716 19d2:ffed ttyUSB0 ttyUSB1 
+u8300 161c:9115 ttyUSB1 ttyUSB2
+air720 1286:4e3d ttyUSB1 ttyUSB0
+KMC-L570 05c6:9025 ttyUSB3 ttyUSB2
+ec20 05c6:9215 ttyUSB3 ttyUSB2 
+sim7600 1e0e:9001 ttyUSB2 ttyUSB3
+slm790 2dee:4d20 ttyUSB4 ttyUSB1
+nl668 1508:1001 ttyUSB2 ttyUSB1
+m8321 19d2:0579 ttyUSB1 ttyUSB0
+l718 2cb7:0001 ttyUSB0 ttyUSB2
+l716 2cb7:0001 ttyUSB0 ttyUSB2
+5Ghuawei 12d1:15c3 ttyUSB1 ttyUSB1
+5Grm500 2c7c:0800 ttyUSB0 ttyUSB2
+5GF03x 05c6:9091 ttyUSB0 ttyUSB1
+5Gfm150 2cb7:0109 ttyUSB1 ttyUSB1    GobiNet
+5Gfm150 2cb7:0104 ttyUSB1 ttyUSB1    GobiNet
+5Gfm150 2cb7:0105 ttyUSB1 ttyUSB1    cdc_ether
+5GT_W 2077:2004 ttyUSB2 ttyUSB2
+me909s 12d1:15c1 ttyUSB0 ttyUSB0
+ML7820 19d2:0532 ttyUSB0 ttyUSB0
+EM12_G 2c7c:0512 ttyUSB2 ttyUSB2
+FG621  2cb7:0a04 ttyUSB0 ttyUSB0
+FG621  2cb7:0a05 ttyUSB0 ttyUSB0
+FG621  2cb7:0a06 ttyUSB0 ttyUSB0
+Yuge_AC 1286:4e3c ttyUSB1 ttyUSB1
+Yuge_CLM920 05c6:9025 ttyUSB2 ttyUSB2 	gobinet_yg
+U8300W 1c9e:9b05 ttyUSB1 ttyUSB1 	gobinet_ls
+lm9248 1c9e:9b11 ttyUSB2 ttyUSB3	ppp
+BLM960 05c6:902d ttyUSB2 ttyUSB2        gobinet_yg
+BLM960 05c6:9025 ttyUSB3 ttyUSB2
+5Grm500u 2c7c:0900 ttyUSB0 ttyUSB2
+TM21C 1782:5d20 ttyUSB0 ttyUSB0
+EM060K 2c7c:030b ttyUSB2 ttyUSB3

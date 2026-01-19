@@ -1,0 +1,14 @@
+#!/bin/sh /etc/rc.common
+
+START=98
+start(){
+mkdir -p /usr/sbin/anywifi/rclocal.d/ >/dev/null 2>&1 
+if [ ! -f /tmp/any_rclocal ];then
+	for i in /usr/sbin/anywifi/rclocal.d/*;do
+	    if [ -f $i ];then
+        	$i &
+    	    fi
+	done
+	echo "">/tmp/any_rclocal
+fi
+}

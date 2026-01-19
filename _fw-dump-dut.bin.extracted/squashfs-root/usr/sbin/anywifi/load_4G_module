@@ -1,0 +1,37 @@
+#Reg dev
+echo '2c7c 0125 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '2c7c 0306 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '2c7c 0620 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '1c9e 9b05 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '2001 7e16 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '05c6 6000 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '05c6 9025 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '05c6 9020 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '05c6 9215 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '161c 9115 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '1286 4e3d ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '2c7c 6026 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '2dee 4d20 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '1508 1001 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '2cb7 0001 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '1508 1001 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '19d2 0579 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '19d2 0532 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '2cb7 0109 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '2cb7 0104 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '2cb7 0105 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '2c7c 0800 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '2c7c 0512 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '2cb7 0a04 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '2cb7 0a05 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '2cb7 0a06 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo "1286 4e3c ff" > /sys/bus/usb-serial/drivers/option1/new_id 	YUGE-CLM920-AC5
+echo "05c6 9025 ff" > /sys/bus/usb-serial/drivers/option1/new_id 	YUGE-CLM920-NC5
+echo "1c9e 9b05 ff" > /sys/bus/usb-serial/drivers/option1/new_id 	long-u8300w
+echo "1c9e 9b11 ff" > /sys/bus/usb-serial/drivers/option1/new_id
+echo "05c6 902d ff" > /sys/bus/usb-serial/drivers/option1/new_id
+echo '2c7c 0900 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '2c7c 6005 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '2c7c 6002 ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '2c7c 030b ff' > /sys/bus/usb-serial/drivers/option1/new_id
+echo '1e0e 9001 ff' > /sys/bus/usb-serial/drivers/option1/new_id

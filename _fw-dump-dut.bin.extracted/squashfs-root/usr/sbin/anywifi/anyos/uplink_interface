@@ -1,0 +1,498 @@
+#!/bin/sh
+
+debug=$(echo $@ | grep "\-\-debug" | wc -l)
+debug_echo(){ if [[ "$debug" == "1" ]];then message="$(date +%s) $1"; echo "$message" 1>&2; logger "$message" >/dev/null 2>&1;fi }
+
+my_uci_get(){
+        if [ "$(uci get "$1" 2>&1 | grep "Entry not found" | wc -l)" == "1" ];then
+                debug_echo "$1 not found"  1>&2
+        else
+                echo -n "$(uci get "$1")"
+        fi
+}
+
+. /usr/share/libubox/jshn.sh
+
+if [ -z "$1" ];then
+	cmd_id="$(cat /dev/urandom 2>/dev/null | head -n 5 | md5sum | head -c 10)"
+else
+	cmd_id="$1"
+fi
+
+device_id="$(cat /proc/flashid 2>/dev/null)"
+# not have flashid
+if [ -z "$device_id" ];then
+	debug_echo "Flashid is empty, fatal error, quit"
+	device_id="$(ifconfig br-lan | awk '/HWaddr/{print $5}' | tr -d ':')"
+fi
+
+response(){
+	json_init
+	json_add_string cmd_id "$cmd_id"
+	json_add_string op "response"
+	json_add_string device_id "$device_id"
+	any_mqtt_client --unixsock /tmp/anyos_tcp -D "$(json_dump)"
+	debug_echo "$(json_dump)"
+}
+
+online(){
+	json_init
+	json_add_string cmd_id "$cmd_id"
+	json_add_string op "online"
+	json_add_string device_id "$device_id"
+
+	any_mqtt_client --unixsock /tmp/anyos_tcp -D "$(json_dump)"
+	debug_echo "$(json_dump)"
+}
+
+offline(){
+	json_init
+	json_add_string cmd_id "$cmd_id"
+	json_add_string op "offline"
+	json_add_string device_id "$device_id"
+
+	any_mqtt_client --unixsock /tmp/anyos_tcp -D "$(json_dump)"
+	debug_echo "$(json_dump)"
+}
+
+heartbeat(){
+	json_init
+	json_add_string cmd_id "$cmd_id"
+	json_add_string op "heartbeat"
+	json_add_string device_id "$device_id"
+
+	any_mqtt_client --unixsock /tmp/anyos_tcp -D "$(json_dump)"
+	debug_echo "$(json_dump)"
+}
+
+flow(){
+	[ ! -d /tmp/anyos ] && mkdir /tmp/anyos
+	traffic_now="$(cat /proc/net/dev)"
+	wan_ifname="$(my_uci_get network.wan.ifname)"
+	[ -z "$wan_ifname" ] && wan_ifname=NO_IFNAME
+	lan_ifname="br-lan"
+	#获取模块流量数据列表数据
+	mqtt_traffic_list="$(cat /tmp/anyos/mqtt_traffic_list)"
+	#清零列表
+	echo "" > /tmp/anyos/mqtt_traffic_list
+
+	# 获取模块列表
+	module_section_list="$(uci show network | sed -n 's/network.\(4gwan[0-9]*\)\+=interface/\1/p')"
+	for module_section in $module_section_list
+	do
+		# 根据 module_section 找出模块的两种 ifname
+		module_ifname_tmp="$(my_uci_get network.${module_section}.ifname)"
+		[ -z "$module_ifname_tmp" ] && module_ifname_tmp="NONE"
+		module_ifname_tmp_add="3g-${module_section}"
+
+		#ifname 接口取当前流量
+		flow_module_up_now="$(echo "$traffic_now" | grep -w "${module_ifname_tmp}" | awk '{print $10}')"
+		flow_module_down_now="$(echo "$traffic_now" | grep -w "${module_ifname_tmp}" | awk '{print $2}')"
+		#3g-xxx取当前流量
+		flow_3g_up_now="$(echo "$traffic_now" | grep -w "${module_ifname_tmp_add}" | awk '{print $10}')"
+		flow_3g_down_now="$(echo "$traffic_now" | grep -w "${module_ifname_tmp_add}" | awk '{print $2}')"
+		#记录当前运行流量并覆盖
+		echo "${module_ifname_tmp}_up_old = $flow_module_up_now" >> /tmp/anyos/mqtt_traffic_list
+		echo "${module_ifname_tmp}_down_old = $flow_module_down_now" >> /tmp/anyos/mqtt_traffic_list
+		echo "${module_ifname_tmp_add}_up_old = $flow_3g_up_now" >> /tmp/anyos/mqtt_traffic_list
+		echo "${module_ifname_tmp_add}_down_old = $flow_3g_down_now" >> /tmp/anyos/mqtt_traffic_list
+		#取上一次记录
+		flow_module_up_old="$(echo "$mqtt_traffic_list" | grep -w "${module_ifname_tmp}_up_old" | awk '{print $3}')"
+		flow_module_down_old="$(echo "$mqtt_traffic_list" | grep -w "${module_ifname_tmp}_down_old" | awk '{print $3}')"
+		flow_3g_up_old="$(echo "$mqtt_traffic_list" | grep -w "${module_ifname_tmp_add}_up_old" | awk '{print $3}')"
+		flow_3g_down_old="$(echo "$mqtt_traffic_list" | grep -w "${module_ifname_tmp_add}_down_old" | awk '{print $3}')"
+		#和上一次记录求差值
+		flow_module_up_diff="$((flow_module_up_now - flow_module_up_old))"
+		flow_module_down_diff="$((flow_module_down_now - flow_module_down_old))"
+		flow_3g_up_diff="$((flow_3g_up_now - flow_3g_up_old))"
+		flow_3g_down_diff="$((flow_3g_down_now - flow_3g_down_old))"
+		#如果now-old数据为负，网卡重启，认为流量是累积值，3g-xxx部分与ifname部分分离单独计算
+		if [ "$flow_module_up_diff" -lt 0 -o "$flow_module_down_diff" -lt 0 ];then
+			flow_module_up_diff="$flow_module_up_now"
+			flow_module_down_diff="$flow_module_down_now"
+		fi
+		if [ "$flow_3g_up_diff" -lt 0 -o "$flow_3g_down_diff" -lt 0 ];then
+			flow_3g_up_diff="$flow_3g_up_now"
+			flow_3g_down_diff="$flow_3g_down_now"
+		fi
+		flow_4g_up="$((flow_4g_up + flow_module_up_diff + flow_3g_up_diff))"
+		flow_4g_down="$((flow_4g_down + flow_module_down_diff + flow_3g_down_diff))"
+	done
+
+	# 取lan wan当前流量
+	flow_wan_up_now="$(echo "$traffic_now" | grep -w "$wan_ifname" | awk '{print $10}')"
+	flow_wan_down_now="$(echo "$traffic_now" | grep -w "$wan_ifname" | awk '{print $2}')"
+	flow_lan_up_now="$(echo "$traffic_now" | grep -w "$lan_ifname" | awk '{print $10}')"
+	flow_lan_down_now="$(echo "$traffic_now" | grep -w "$lan_ifname" | awk '{print $2}')"
+
+	#记录lan wan当前运行流量并覆盖
+	echo "${wan_ifname}_up_old = $flow_wan_up_now" >> /tmp/anyos/mqtt_traffic_list
+	echo "${wan_ifname}_down_old = $flow_wan_down_now" >> /tmp/anyos/mqtt_traffic_list
+	echo "${lan_ifname}_up_old = $flow_lan_up_now" >> /tmp/anyos/mqtt_traffic_list
+	echo "${lan_ifname}_down_old = $flow_lan_down_now" >> /tmp/anyos/mqtt_traffic_list
+
+	#取lan wan上一次记录
+	flow_wan_up_old="$(echo "$mqtt_traffic_list" | grep -w "${wan_ifname}_up_old" | awk '{print $3}')"
+	flow_wan_down_old="$(echo "$mqtt_traffic_list" | grep -w "${wan_ifname}_down_old" | awk '{print $3}')"
+	flow_lan_up_old="$(echo "$mqtt_traffic_list" | grep -w "${lan_ifname}_up_old" | awk '{print $3}')"
+	flow_lan_down_old="$(echo "$mqtt_traffic_list" | grep -w "${lan_ifname}_down_old" | awk '{print $3}')"
+	#和上一次lan wan记录求差值
+	flow_wan_up="$((flow_wan_up_now - flow_wan_up_old))"
+	flow_wan_down="$((flow_wan_down_now - flow_wan_down_old))"
+	flow_lan_up="$((flow_lan_up_now - flow_lan_up_old))"
+	flow_lan_down="$((flow_lan_down_now - flow_lan_down_old))"
+
+	#如果lan wan的 now-old数据为负，网卡重启，认为流量是累积值
+	if [ "$flow_wan_up" -lt 0 -o "$flow_wan_down" -lt 0 ];then
+		flow_wan_up="$flow_wan_up_now"
+		flow_wan_down="$flow_wan_down_now"
+	fi
+	if [ "$flow_lan_up" -lt 0 -o "$flow_lan_down" -lt 0 ];then
+		flow_lan_up="$flow_lan_up_now"
+		flow_lan_down="$flow_lan_down_now"
+	fi
+
+	#排除错误数据
+	if [[ -z "$flow_wan_up" ]] || [[ "$flow_wan_up" -le 0 ]];then
+		flow_wan_up=0
+	fi
+	if [[ -z "$flow_wan_down" ]] || [[ "$flow_wan_down" -le 0 ]];then
+		flow_wan_down=0
+	fi
+
+	if [[ -z "$flow_lan_up" ]] || [[ "$flow_lan_up" -le 0 ]];then
+		flow_lan_up=0
+	fi
+	if [[ -z "$flow_lan_down" ]] || [[ "$flow_lan_down" -le 0 ]];then
+		flow_lan_down=0
+	fi
+
+	if [[ -z "$flow_4g_up" ]] || [[ "$flow_4g_up" -lt 0 ]];then
+		flow_4g_up=0
+	fi
+	if [[ -z "$flow_4g_down" ]] || [[ "$flow_4g_down" -le 0 ]];then
+		flow_4g_down=0
+	fi
+
+	json_init
+	json_add_string cmd_id "$cmd_id"
+	json_add_string op "reportFlow"
+	json_add_string device_id "$device_id"
+
+	json_add_object "data"
+	json_add_string flow_wan_up "$flow_wan_up"
+	json_add_string flow_wan_down "$flow_wan_down"
+	json_add_string flow_lan_up "$flow_lan_up"
+	json_add_string flow_lan_down "$flow_lan_down"
+	json_add_string flow_4g_up "$flow_4g_up"
+	json_add_string flow_4g_down "$flow_4g_down"
+	json_close_object
+
+	any_mqtt_client --unixsock /tmp/anyos_tcp -D "$(json_dump)"
+	debug_echo "$(json_dump)"
+}
+
+log(){
+	json_init
+	# json_add_string cmd_id "$cmd_id"
+	json_add_string op "reportSysLog"
+	json_add_string device_id "$device_id"
+	json_add_string data "$(dmesg)"
+	echo "$(json_dump)" > /tmp/os_dmsg_tmp
+	any_mqtt_client --unixsock /tmp/anyos_tcp -f /tmp/os_dmsg_tmp
+	debug_echo "$(json_dump)"
+}
+
+status(){
+	device_model="$(my_uci_get anyversion.device.device_model_displayname)"
+	if [ -z "$device_model" ];then
+		device_model="$(my_uci_get anyversion.device.device_model)"
+	fi
+
+	device_version="$(my_uci_get anyversion.device.device_version)"
+	uptime="$(cat /proc/uptime | awk -F '.' '{print $1}')"
+	mac_lan="$(cat /sys/class/net/br-lan/address | tr ':' '-')"
+	ip_lan="$(ifconfig br-lan | grep "inet addr" | awk -F ':' '{print $2}' | awk '{print $1}')"
+	ip_public="$(curl -Lk http://faas.hangzhou.epplink.net/ip 2>/dev/null)"
+	net="$(route -n | grep -w "UG" | awk 'NR==1 {print $8}')"
+	wanifname="$(my_uci_get network.wan.ifname)"
+
+	[ -z "$device_model" ] && device_model="UNKNOWN"
+	[ -z "device_version" ] && sysversion="0.0"
+	[ -z "uptime" ] && uptime="0"
+	[ -z "mac_lan" ] && mac_lan="00-00-00-00"
+	[ -z "ip_lan" ] && ip_lan="0.0.0.0"
+
+	if [ -z "$ip_public" ];then
+		ip_public="1.1.1.1"
+	fi
+
+	net_status="none"
+	[ -f "/tmp/netstat.txt" ] && net_status="$(cat /tmp/netstat.txt)"
+	if [ "$net_status" == "none" ];then
+		internet=none
+	elif [ "$net_status" == "$wanifname" -o "$net_status" == "pppoe-wan" ];then
+		internet=ether
+	else
+		internet=4g
+	fi
+
+	wifi_type="$(my_uci_get anyos.wifi.wifi_type)"
+	wifi2_ssid="$(my_uci_get wireless.default_radio0.ssid)"
+	[ -z "wifi2_ssid" ] && wifi2_ssid=0
+
+	#wifi2 ifname save at anyos.wifi
+	wifi2_ifname="$(my_uci_get anyos.wifi.wifi2_ifname | awk '{print $1}')"
+	wifi2_ifname="$(ifconfig | grep -wo "$wifi2_ifname")"
+	wifi2_online_user_num=0
+	[ "$wifi2_ifname" != "" ] && wifi2_online_user_num="$(iwpriv "$wifi2_ifname" get_mac_table | sed '1,2d' | sed '$d' | wc -l)"
+	wifi2_device="$(my_uci_get anyos.wifi.wifi2_device)"
+	channel2="$(my_uci_get wireless.${wifi2_device}.channel)"
+	if [ "$channel2" == "0" ];then
+		channel2="auto"
+	fi
+	bw2="$(my_uci_get wireless.${wifi2_device}.bw)"
+	if [ "$bw2" == "0" ];then
+		htmode2=HT20
+	elif [ "$bw2" == "1" ];then
+		htmode2=HT40
+	else
+		htmode2=0
+	fi
+
+	wifi2_hidden="$(my_uci_get wireless.default_radio0.hidden)"
+	if [ "$wifi2_hidden" != 1 ];then
+		wifi2_hidden=show
+	else
+		wifi2_hidden=hide
+	fi
+
+	if (my_uci_get wireless.default_radio0.encryption | grep -q "none") ;then
+		wifi2_encrypt=not_encrypt
+	else
+		wifi2_encrypt=encrypt
+	fi
+
+	key2="$(my_uci_get wireless.default_radio0.key)"
+	if [ -z "$key2" ];then
+		key2=0
+	fi
+
+	wifi5_online_user_num=0
+	wifi5="$(my_uci_get anyos.wifi.wifi5_ifname)"
+	channel5=0
+	htmode5=0
+	wifi5_hidden=0
+	wifi5_encrypt=0
+	key5=0
+	if [ ! -z "$wifi5" ];then
+		wifi5_device="$(my_uci_get anyos.wifi.wifi5_device)"
+		channel5="$(my_uci_get wireless.${wifi5_device}.channel)"
+		if [ "$channel5" == "0" ];then
+			channel5="auto"
+		fi
+		bw5="$(my_uci_get wireless.${wifi5_device}.bw)"
+		if [ "$bw5" == "0" ];then
+			htmode5=HT20
+		elif [ "$bw5" == "1" ];then
+			htmode5=HT40
+		elif [ "$bw5" == "2" ];then
+			htmode5=HT80
+		fi
+
+		wifi5_ssid="$(my_uci_get wireless.default_radio1.ssid)"
+		#wifi5 ifname save at anyos.wifi
+		wifi5_ifname="$(my_uci_get anyos.wifi.wifi5_ifname | awk '{print $1}')"
+		wifi5_ifname="$(ifconfig | grep -wo "$wifi5_ifname")"
+		[ "$wifi5_ifname" != "" ] && wifi5_online_user_num="$(iwpriv "$wifi5_ifname" get_mac_table | sed '1,2d' | sed '$d' | wc -l)"
+
+		wifi5_hidden="$(my_uci_get wireless.default_radio1.hidden)"
+		if [ "$wifi5_hidden" != 1 ];then
+			wifi5_hidden=show
+		else
+			wifi5_hidden=hide
+		fi
+
+		if (my_uci_get wireless.default_radio1.encryption | grep -q "none") ;then
+			wifi5_encrypt=not_encrypt
+		else
+			wifi5_encrypt=encrypt
+		fi
+
+		key5="$(my_uci_get wireless.default_radio1.key)"
+		if [ -z "$key5" ];then
+			key5=0
+		fi
+
+	else
+		wifi5_ssid=0
+	fi
+
+	json_init
+	json_add_string cmd_id "$cmd_id"
+	json_add_string op "reportDeviceStatus"
+	json_add_string device_id "$device_id"
+	json_add_object "data"
+	json_add_string device_model "$device_model"
+	json_add_string device_version "$device_version"
+	json_add_string uptime "$uptime"
+	json_add_string mac_lan "$mac_lan"
+	json_add_string ip_lan "$ip_lan"
+	json_add_string ip_public "$ip_public"
+	json_add_string internet "$internet"
+	json_add_string wifi_type "$wifi_type"
+	json_add_string wifi2_ssid "$wifi2_ssid"
+	json_add_string wifi5_ssid "$wifi5_ssid"
+	json_add_string wifi2_channel "$channel2"
+	json_add_string wifi5_channel "$channel5"
+	json_add_string wifi2_htmode "$htmode2"
+	json_add_string wifi5_htmode "$htmode5"
+	json_add_string wifi2_hidden "$wifi2_hidden"
+	json_add_string wifi5_hidden "$wifi5_hidden"
+	json_add_string wifi2_encrypt "$wifi2_encrypt"
+	json_add_string wifi5_encrypt "$wifi5_encrypt"
+	json_add_string key2 "$key2"
+	json_add_string key5 "$key5"
+	json_add_string wifi2_online_user_num "$wifi2_online_user_num"
+	json_add_string wifi5_online_user_num "$wifi5_online_user_num"
+	json_close_object
+
+	debug_echo "$(json_dump)"
+	any_mqtt_client --unixsock /tmp/anyos_tcp -D "$(json_dump)"
+}
+
+reportOwnship(){
+	owner="$(my_uci_get anyos.cloude_manage.device_owner)"
+	[ -z "$owner" ] && owner=0
+	remark="$(my_uci_get anyos.cloude_manage.device_desc)"
+	[ -z "$device_desc" ] && device_desc=0
+	mac="$(ifconfig br-lan | awk '/HWaddr/{print $5}')"
+	[ -z "$mac" ] && mac=0
+
+	json_init
+	json_add_string cmd_id "$cmd_id"
+	json_add_string op "reportOwnship"
+	json_add_string device_id "$device_id"
+
+	json_add_object "data"
+	json_add_string owner "$owner"
+	json_add_string remark "$remark"
+	json_add_string mac "$mac"
+	json_close_object
+	any_mqtt_client --unixsock /tmp/anyos_tcp -D "$(json_dump)"
+	debug_echo "$(json_dump)"
+}
+
+reportNgrokId(){
+	ngrokid="$(my_uci_get anyos.cloud_weblogin.login_id)"
+	[ -z "$ngrokid" ] && /usr/sbin/anywifi/crond.d/S99_check_ngrokc 1>/dev/null 2>&1
+	ngrokid="$(my_uci_get anyos.cloud_weblogin.login_id)"
+	[ -z "$ngrokid" ] && ngrokid=0
+	switch="$(my_uci_get anyos.cloud_weblogin.switch)"
+
+	json_init
+	json_add_string cmd_id "$cmd_id"
+	json_add_string op "reportNgrokId"
+	json_add_string device_id "$device_id"
+
+	json_add_object "data"
+	json_add_string ngrokid "$ngrokid"
+	json_add_string EnabeLoginOnline "$switch"
+	json_close_object
+
+	any_mqtt_client --unixsock /tmp/anyos_tcp -D "$(json_dump)"
+	debug_echo "$(json_dump)"
+}
+
+reportNearbyAp(){
+	json_init
+	json_add_string cmd_id "1234"
+	json_add_string op "reportNearbyAp"
+	json_add_string device_id "$device_id"
+	json_add_array "data"
+
+	wifi2_ifname="$(my_uci_get anyos.wifi.wifi2_ifname | awk '{print $1}')"
+	wifi5_ifname="$(my_uci_get anyos.wifi.wifi5_ifname | awk '{print $1}')"
+
+	wifi_all_ifname="$wifi2_ifname $wifi5_ifname"
+	for wifi_ifname in $wifi_all_ifname
+	do
+		iwpriv $wifi_ifname set SiteSurvey=
+		sleep 2
+		iw_date="$(iwpriv $wifi_ifname get_site_survey | sed '1,2d' | sed '$d')"
+		counter="$(echo "$iw_date" | wc -l)"
+		current_line=1
+		while [ "$current_line" -le "$counter" ];do
+				date_line="$(echo "$iw_date" | awk 'NR=="'"$current_line"'"{print}')"
+				ssid="$(echo "$date_line" | awk '{print $2}')"
+				if [ -n "$(echo "$ssid" | grep '\([A-Fa-f0-9]\{2\}:\)\{5\}[A-Fa-f0-9]\{2\}')" ];then
+					ssid=""
+					bssid="$(echo "$date_line" | awk '{print $2}')"	
+					signal="$(echo "$date_line" | awk '{print $4}')"
+					[ -z "$signal" ] && signal=0
+					signal="$((signal - 100))"
+					enc="$(echo "$date_line" | awk '{print $3}')"
+				else
+					bssid="$(echo "$date_line" | awk '{print $3}')"
+					signal="$(echo "$date_line" | awk '{print $5}')"
+					[ -z "$signal" ] && signal=0
+					signal="$((signal - 100))"
+					enc="$(echo "$date_line" | awk '{print $4}')"
+				fi
+				json_add_object
+				json_add_string ssid "$ssid"
+				json_add_string bssid "$bssid"
+				json_add_string signal "$signal"
+				json_close_object
+				current_line="$((current_line+1))"
+		done
+	done
+	json_close_array
+	any_mqtt_client --unixsock /tmp/anyos_tcp -D "$(json_dump)"
+	debug_echo "$(json_dump)"
+}
+
+reset_api(){
+	json_init
+	json_add_string op "reset"
+	json_add_string cmd_id "$cmd_id"
+	json_add_string device_id "$device_id"
+
+	any_mqtt_client --unixsock /tmp/anyos_tcp -D "$(json_dump)"
+	debug_echo "$(json_dump)"
+}
+
+reportGps(){
+	gps | while read latitude longitude ns ew speed utc ;do
+	#latitude ddmm.mmmmmm longitude dddmm.mmmmmm
+	#map dd.dddddd
+	debug_echo "latitude=$latitude longitude=$longitude ns=$ns ew=$ew"
+
+	latitude_d="$(echo "${latitude:0:2}")"
+	latitude_m="$(echo "${latitude:2}")"
+	latitude="$(echo "$latitude_d $latitude_m" | awk '{printf("%.6f\n",$1+$2/60)}')"
+	debug_echo "latitude=$latitude latitude_d=$latitude_d latitude_m=$latitude_m"
+
+	longitude_d="$(echo "${longitude:0:3}")"
+	longitude_m="$(echo "${longitude:3}")"
+	longitude="$(echo "$longitude_d $longitude_m" | awk '{printf("%.6f\n",$1+$2/60)}')"
+	debug_echo "longitude=$longitude longitude_d=$longitude_d longitude_m=$longitude_m"
+
+		if [ "$ns" == S ];then
+			latitude="-$latitude"
+		fi
+		if [ "$ew" == W ];then
+			longitude="-$longitude"
+		fi
+		json_init
+		json_add_string op "reportGps"
+		json_add_string cmd_id "$cmd_id"
+		json_add_string device_id "$device_id"
+		json_add_object 'data'
+		json_add_string latitude "$latitude"
+		json_add_string longitude "$longitude"
+		json_close_object
+		any_mqtt_client --unixsock /tmp/anyos_tcp -D "$(json_dump)"
+		debug_echo "$(json_dump)"
+	done
+}

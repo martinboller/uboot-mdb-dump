@@ -1,0 +1,74 @@
+#!/bin/sh
+
+port1="eth1"
+port2="eth2"
+tm=30
+
+while true
+do
+
+rx_before1=`cat /sys/class/net/$port1/statistics/rx_bytes`
+tx_before1=`cat /sys/class/net/$port1/statistics/tx_bytes`
+rx_before2=`cat /sys/class/net/$port2/statistics/rx_bytes`
+tx_before2=`cat /sys/class/net/$port2/statistics/tx_bytes`
+
+
+
+sleep $tm
+rx_after1=`cat /sys/class/net/$port1/statistics/rx_bytes`
+tx_after1=`cat /sys/class/net/$port1/statistics/tx_bytes`
+rx_after2=`cat /sys/class/net/$port2/statistics/rx_bytes`
+tx_after2=`cat /sys/class/net/$port2/statistics/tx_bytes`
+
+rx_result1=`expr $rx_after1 - $rx_before1`
+tx_result1=`expr $tx_after1 - $tx_before1`
+rx_result2=`expr $rx_after2 - $rx_before2`
+tx_result2=`expr $tx_after2 - $tx_before2`
+
+echo "4G1 $tm秒新增流量 $rx_result1 $tx_result1 "
+echo "4G2 $tm秒新增流量 $rx_result2 $tx_result2 "
+
+
+
+uptime=`cat /proc/uptime |awk '{print $1}'|cut -d "." -f1`
+date=`date +%Y_%m_%d%t%H:%M:%S|awk '{print $1}'`
+time=`date +%Y_%m_%d%t%H:%M:%S|awk '{print $2}'`
+
+
+
+if [ ! -e /etc/4gflowall ] ;then
+        echo "创建4G流量文件"
+		echo "0 0" >/etc/4gflowall
+		echo "0 0" >>/etc/4gflowall
+		#echo "$rx_result" >>/etc/4gflowall
+else	
+	    echo "$date $time $uptime $rx_result1 $tx_result1 $rx_result2 $tx_result2">>/tmp/4gflow.log	
+
+
+ethrx1=`awk '{print $1}' /etc/4gflowall|sed -n 1p`   #4G1-RX
+ethtx1=`awk '{print $2}' /etc/4gflowall|sed -n 1p`   #4G1-TX
+ethrx2=`awk '{print $1}' /etc/4gflowall|sed -n 2p`   #4G2-RX
+ethtx2=`awk '{print $2}' /etc/4gflowall|sed -n 2p`   #4G2-TX
+
+
+ethrxall1=`expr $ethrx1 + $rx_after1`
+ethtxall1=`expr $ethtx1 + $rx_after1`
+ethrxall2=`expr $ethrx2 + $rx_after2`
+ethtxall2=`expr $ethtx2 + $rx_after2`
+
+
+
+
+echo "4G1 历史累计总流量 $ethrxall1 $ethtxall1 "
+echo "4G2 历史累计总流量 $ethrxall2 $ethtxall2"		
+		echo "$ethrxall1 $ethtxall1" >/etc/4gflowall
+		echo "$ethrxall2 $ethtxall2" >>/etc/4gflowall		
+		
+echo "$ethtxall1,$ethrxall1|$ethtxall2,$ethrxall2|0,0|0,0" >/tmp/4gflow	
+echo "$ethtxall1,$ethrxall1|$ethtxall2,$ethrxall2|0,0|0,0"
+	
+		
+
+fi
+
+done

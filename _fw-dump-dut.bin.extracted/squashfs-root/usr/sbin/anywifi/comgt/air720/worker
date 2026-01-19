@@ -1,0 +1,134 @@
+#!/bin/sh
+
+. /usr/sbin/anywifi/dial_common.sh
+
+#ret="$(comgt -d $at_port -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat)"
+
+module_type=$(cat /tmp/mobile_module_name.txt | awk -F ' ' '{print $1}')
+module_data_usb=$(cat /tmp/mobile_module_name.txt | awk -F ' ' '{print $3}')
+module_at_usb=$(cat /tmp/mobile_module_name.txt | awk -F ' ' '{print $4}')
+
+num=2
+while [ 1 ]
+do
+	counter=1
+	while [ $counter -le $num ]
+	do
+		sim="$(comgt -d /dev/$module_at_usb -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.sim)"
+		ret="$(echo "$sim" | grep -w "READY" | wc -l)"
+		if [ "$ret" == "1" ];then
+			sim="READY"
+			debug_echo "+CPIN: READY"
+			break
+		else
+			sim="no sim card"
+			debug_echo "no sim card"
+			counter=$(($counter + 1))
+			sleep 1
+		fi
+	done
+	
+	counter=1
+	while [ $counter -le $num ]
+	do
+		csq="$(comgt -d /dev/$module_at_usb -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.csq)"
+		ret="$(echo "$csq" | grep "+CSQ:" | awk '{print $2}' | awk -F ',' '{print $1}')"
+		if [ "$ret" -le 31 ];then
+			csq="$ret"
+			debug_echo "CSQ is $csq"
+			break
+		else
+			csq=""
+			debug_echo "no signal"
+			counter=$(($counter + 1))
+			sleep 1
+		fi
+	done
+	
+	counter=1
+	while [ $counter -le $num ]
+	do
+		iccid="$(comgt -d /dev/$module_at_usb -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.iccid)"
+		ret="$(echo "$iccid" |  grep "+ICCID:" | awk -F ': ' '{print $2}' | wc -L)"
+		if [ "$ret" == "20" ];then
+			iccid="$(echo "$iccid" |  grep "+ICCID:" | awk -F ': ' '{print $2}' | tr -d '\r')"
+			debug_echo "iccid is $iccid"
+			break
+		else
+			iccid=""
+			debug_echo "no iccid"
+			counter=$(($counter + 1))
+			sleep 1
+		fi
+	done
+	
+	counter=1
+	while [ $counter -le $num ]
+	do
+		imsi="$(comgt -d /dev/$module_at_usb -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.imsi)"
+		ret="$(echo $imsi | awk -F ' ' '{print $2}' | wc -L)"
+		if [ "$ret" == "15" ];then
+			imsi="$(echo $imsi | awk -F ' ' '{print $2}')"
+			debug_echo "imsi is $imsi"
+			break
+		else
+			imsi=""
+			debug_echo "not get imsi"
+			counter=$(($counter + 1))
+			sleep 1
+		fi
+	done
+	
+	counter=1
+	while [ $counter -le $num ]
+	do
+		imei="$(comgt -d /dev/$module_at_usb -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.imei)"
+		ret="$(echo $imei | awk -F ' ' '{print $2}' | wc -L)"
+		if [ "$ret" == "15" ];then
+			imei="$(echo $imei | awk -F ' ' '{print $2}')"
+			debug_echo "imei is $imei"
+			break
+		else
+			imei=""
+			debug_echo "not get imei"
+			counter=$(($counter + 1))
+			sleep 1
+		fi
+	done
+	
+	counter=1
+	while [ $counter -le $num ]
+	do
+		cops="$(comgt -d /dev/$module_at_usb /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.cops)"
+		ret="$(echo $cops | awk -F '"' '{print $2}')"
+		if [ "$ret" == "" -o "$(echo $ret | grep "ERRO" | wc -l)" == "1" ];then
+			cops=""
+			counter=$(($counter + 1))
+			sleep 1
+		elif [ "$(echo $ret | grep "460" | wc -l)" == "1" ];then
+			cops="$(network_provider $ret)"
+			break
+		else
+			cops="$ret"
+			break
+		fi
+	done
+	
+	qnwinfo="$(comgt -d /dev/$module_at_usb -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.qnwinfo)"
+	qnwinfo="$ret"
+	
+cat > /tmp/4ginfo <<EOF
+{
+	"device_model":"$module_type",
+	"sim_status":"$sim",
+	"signal":"$csq",
+	"iccid":"$iccid",
+	"imsi":"$imsi",
+	"imei":"$imei",
+	"cops":"${cops}",
+	"qnwinfo":"$qnwinfo"
+}
+EOF
+
+	sleep 10
+done

@@ -1,0 +1,55 @@
+#!/bin/sh
+
+[[ "$(pidof ${0##*/} | wc -w)" -gt "2" ]] && echo "Already running ..." && return 2
+ 
+debug=$(echo $@ | grep "\-\-debug" | wc -l)
+debug_echo(){ if [[ "$debug" == "1" ]];then message="$(date +%s) $1"; echo "$message" 1>&2; logger "$message";fi }
+ 
+my_uci_get(){
+        if [ "$(uci get "$1" 2>&1 | grep "Entry not found" | wc -l)" == "1" ];then
+                debug_echo "$1 not found"  1>&2                                    
+        else                        
+                echo -n "$(uci get "$1")"
+        fi                       
+}
+
+module_type="u8300"
+at_port="/dev/ttyUSB2"
+
+#ret="$(comgt -d $at_port -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat)"
+#debug_echo "Comgt return is: $ret"
+
+sim_status_uci="$(my_uci_get 4gstatus.info.sim_status)"
+sim_signal_uci="$(my_uci_get 4gstatus.info.sim_signal)"
+sim_netmode_uci="$(my_uci_get 4gstatus.info.sim_netmode)"
+
+ret_sim="$(comgt -d $at_port -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.sim)"
+debug_echo "Comgt return is: $ret_sim"
+if [ -z "$(echo "$ret_sim" | grep "CPIN:")" ];then
+	debug_echo "Tmp file has no SIM info, next loop"
+	uci set 4gstatus.info.sim_signal="0,99"
+	continue
+fi
+
+ret_csq="$(comgt -d $at_port -s /usr/sbin/anywifi/comgt/$module_type/$module_type.chat.csq)"
+debug_echo "Comgt return is: $ret_csq"
+if [ -z "$(echo "$ret_csq" | grep "CSQ:")" ];then
+	debug_echo "Tmp file has no SIM CSQ info, next loop"
+	continue
+fi
+
+if [ -n "$(echo "$ret_sim" | grep "+CPIN: READY")" ];then
+	uci set 4gstatus.info.sim_status=1
+else
+	uci set 4gstatus.info.sim_status=0
+fi
+
+sim_signal="$(echo "$ret_csq" | grep "+csq:" | awk -F: '{print $2}')"       
+debug_echo "Sim signal is: $sim_signal"                             
+
+
+uci set 4gstatus.info.sim_signal="$sim_signal"
+uci set 4gstatus.info.sim_netmode="$sim_netmode"
+
+
+sleep 10

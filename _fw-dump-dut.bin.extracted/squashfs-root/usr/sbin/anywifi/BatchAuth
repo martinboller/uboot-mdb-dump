@@ -1,0 +1,85 @@
+#!/bin/sh
+
+[[ "$(pidof ${0##*/} | wc -w)" -gt "2" ]] && echo "Already running ..." && return 2
+debug=$(echo $@ | grep "\-\-debug" | wc -l)
+debug_echo(){ if [[ "$debug" == "1" ]];then message="$(date +%s) $1"; echo "$message"; logger "$message";fi }
+
+my_uci_get(){ 
+        if [ "$(uci get "$1" 2>&1 | grep "Entry not found" | wc -l)" == "1" ];then
+                debug_echo "$1 not found"  1>&2                                         
+        else                             
+                echo -n "$(uci get "$1")"
+        fi                            
+}
+
+if [ ! -f /usr/share/libubox/jshn.sh ];then
+	debug_echo "JSHN lib miss ,fatal error"
+	exit
+else
+	. /usr/share/libubox/jshn.sh
+fi
+
+####################
+request_url=$(my_uci_get batchauth.apilist.AuthServer)
+debug_echo "request_url is : $request_url"
+####################
+
+counter=0
+company_code_uci="$(my_uci_get batchauth.device.company_code)"
+machine_code_uci="$(my_uci_get system.@system[0].id)"
+
+while [ -z "$company_code_uci" -o -z "$machine_code_uci" ];do
+	company_code_uci="$(my_uci_get batchauth.device.company_code)"
+	machine_code_uci="$(my_uci_get system.@system[0].id)"
+	if [[ "$counter" -gt 5 ]];then
+		debug_echo "Wait too much time, just quit"
+		exit 2
+	fi
+	counter=$((counter+1))
+	sleep 10
+done
+
+machine_mac="$(ifconfig | grep br-lan | awk '{print $5}' | tr : -)"
+auth_code_uci="$(my_uci_get system.@system[0].auth)"
+auth_status_uci="$(my_uci_get system.@system[0].status)"
+
+json_init
+json_add_string company_code "$company_code_uci"
+json_add_string device_code "$machine_code_uci"
+json_add_string device_mac "$machine_mac"
+status="$(json_dump)"
+debug_echo "Status is $status"
+
+if [ "$auth_status_uci" != "1" ];then
+	ret="$(curl "$request_url" --connect-timeout 2 -d status="${status}" -o - 2>/dev/null )"
+	debug_echo "Server return is : $ret"
+
+	test=$(json_load "$ret" 2>&1 | grep "Failed" | wc -l)                                           
+	if [[ "$test" == "1" ]];then                                                                    
+	      	debug_echo "unacceptable return string (quit): $ret"                                     
+	        exit
+	fi
+                                                                                                
+	json_load "$ret"
+	json_get_var code code
+	json_get_var reason reason
+	json_get_var authorize_code authorize_code
+	debug_echo "return code is : $code , return reason is : $reason"                                
+                                                                                                
+	if [[ -n "$ret" -a $code == "1" ]];then           
+		debug_echo "server return authorize_code is $authorize_code"
+		if [ "$auth_code_uci" != "$authorize_code" ];then
+			debug_echo "Ready to write into UCI"
+			uci set system.@system[0].auth="$authorize_code"
+			uci commit system
+			killall dnsmasqd
+			sleep 1
+			dnsmasqd &
+		else
+			debug_echo "Auth code already write into system"
+		fi
+	fi
+
+else
+	debug_echo "Already authorized , will not query server"
+fi

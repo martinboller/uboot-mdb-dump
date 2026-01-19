@@ -1,0 +1,3 @@
+luci2name="$(uci -q get anyos_mv_luci.base.luci2name)"
+[ -z "$luci2name" ] && luci2name=zbt
+mv /www/cgi-bin/luci /www/cgi-bin/${luci2name}
